@@ -104,7 +104,7 @@ def generate_sql(question):
 
 
 # ───────────────────────────────────────────────
-# FAISS VECTOR STORE (replaces Chroma)
+# FAISS VECTOR STORE – Improved version
 # ───────────────────────────────────────────────
 embeddings = AzureOpenAIEmbeddings(
     model="text-embedding-3-small",
@@ -113,42 +113,93 @@ embeddings = AzureOpenAIEmbeddings(
     azure_deployment="text-embedding-3-small"
 )
 
-
-@st.cache_resource
-def load_faiss():
-    if INDEX_FILE.exists() and METADATA_FILE.exists():
-        try:
-            index = faiss.read_index(str(INDEX_FILE))
-            with open(METADATA_FILE, "rb") as f:
-                metadata = pickle.load(f)
-            return index, metadata
-        except Exception as e:
-            st.warning(f"Could not load FAISS files: {e}. Starting fresh.")
-    return None, []
+# We store one FAISS index + metadata per patient to avoid mixing documents
+INDEX_DIR = Path("faiss_indices")
+INDEX_DIR.mkdir(exist_ok=True)
 
 
-def save_faiss(index, metadata):
-    faiss.write_index(index, str(INDEX_FILE))
-    with open(METADATA_FILE, "wb") as f:
-        pickle.dump(metadata, f)
+def get_patient_key(patient: str) -> str:
+    """Normalize patient name for file key (lowercase, strip, replace spaces)"""
+    if not patient:
+        return "unknown"
+    return patient.strip().lower().replace(" ", "_").replace(".", "")
 
 
-def embed_report(text, patient):
-    splitter = RecursiveCharacterTextSplitter(chunk_size=800, chunk_overlap=100)
+@st.cache_resource(show_spinner=False)
+def load_patient_index(patient: str):
+    key = get_patient_key(patient)
+    index_path = INDEX_DIR / f"{key}_index.faiss"
+    meta_path = INDEX_DIR / f"{key}_meta.pkl"
+
+    if not index_path.exists() or not meta_path.exists():
+        return None, []
+
+    try:
+        index = faiss.read_index(str(index_path))
+        with open(meta_path, "rb") as f:
+            metadata = pickle.load(f)
+        if len(metadata) == 0:
+            return None, []
+        return index, metadata
+    except Exception as e:
+        st.warning(f"Failed to load index for {patient}: {e}")
+        return None, []
+
+
+def save_patient_index(patient: str, index, metadata):
+    key = get_patient_key(patient)
+    index_path = INDEX_DIR / f"{key}_index.faiss"
+    meta_path = INDEX_DIR / f"{key}_meta.pkl"
+
+    try:
+        faiss.write_index(index, str(index_path))
+        with open(meta_path, "wb") as f:
+            pickle.dump(metadata, f)
+        st.success(f"Saved index for {patient} ({len(metadata)} chunks)")
+    except Exception as e:
+        st.error(f"Failed to save index for {patient}: {e}")
+
+
+def embed_report(text: str, patient: str):
+    if not text.strip():
+        st.error("No text extracted from PDF.")
+        return
+
+    patient = patient.strip()
+    if not patient:
+        st.error("Please enter a patient name.")
+        return
+
+    splitter = RecursiveCharacterTextSplitter(
+        chunk_size=700,
+        chunk_overlap=120,
+        separators=["\n\n", "\n", ". ", " ", ""]
+    )
     chunks = splitter.split_text(text)
 
     if not chunks:
-        st.warning("No text extracted from PDF.")
+        st.warning("Splitter produced no chunks.")
         return
 
-    emb_list = embeddings.embed_documents(chunks)
+    with st.spinner(f"Creating {len(chunks)} embeddings..."):
+        try:
+            emb_list = embeddings.embed_documents(chunks)
+        except Exception as e:
+            st.error(f"Embedding API failed: {str(e)}")
+            return
+
     emb_array = np.array(emb_list).astype("float32")
+    if emb_array.shape[0] != len(chunks):
+        st.error("Embedding count mismatch!")
+        return
 
     dim = emb_array.shape[1]
 
-    current_index, current_meta = load_faiss()
+    # Load existing or create new
+    current_index, current_meta = load_patient_index(patient)
+
     if current_index is None:
-        new_index = faiss.IndexFlatL2(dim)  # or IndexFlatIP for cosine
+        new_index = faiss.IndexFlatL2(dim)
         new_meta = []
     else:
         new_index = current_index
@@ -157,39 +208,69 @@ def embed_report(text, patient):
     new_index.add(emb_array)
     new_meta.extend([{"patient": patient, "text": chunk} for chunk in chunks])
 
-    save_faiss(new_index, new_meta)
-    st.success(f"Report embedded for {patient} ({len(chunks)} chunks)!")
+    save_patient_index(patient, new_index, new_meta)
+
+    # Debug info
+    st.info(f"Embedded **{len(chunks)}** chunks for **{patient}**")
+    with st.expander("First 2 chunks preview"):
+        for i, chunk in enumerate(chunks[:2], 1):
+            st.markdown(f"**Chunk {i}** ({len(chunk)} chars):  \n{chunk[:400]}...")
 
 
-def ask_report(question, patient):
-    index, metadata = load_faiss()
-    if index is None or not metadata:
-        return "No report information found for any patient."
+def ask_report(question: str, patient: str):
+    if not patient.strip():
+        return "Please enter a patient name."
 
-    q_emb = embeddings.embed_query(question)
-    q_array = np.array([q_emb]).astype("float32")
+    patient = patient.strip()
+    index, metadata = load_patient_index(patient)
 
-    D, I = index.search(q_array, k=5)  # get more → filter later
+    if index is None or len(metadata) == 0:
+        return f"No embedded report found for patient '{patient}'.\n\nTry uploading and embedding a PDF first."
 
-    relevant = []
-    for idx in I[0]:
-        if idx == -1:
-            continue
-        chunk = metadata[idx]
-        if chunk["patient"] == patient:
-            relevant.append(chunk["text"])
+    with st.spinner("Searching..."):
+        try:
+            q_emb = embeddings.embed_query(question)
+            q_array = np.array([q_emb]).astype("float32")
 
-    if not relevant:
-        return f"No matching report chunks found for patient '{patient}'."
+            # Search more candidates → filter later
+            distances, indices = index.search(q_array, k=8)
 
-    context = "\n\n".join(relevant[:3])  # top 3 most relevant
-    prompt = f"""Context from patient report:\n{context}
+            relevant_chunks = []
+            scores = []
+
+            for idx, dist in zip(indices[0], distances[0]):
+                if idx == -1:
+                    continue
+                chunk_data = metadata[idx]
+                # Still double-check patient (in case of index mixup)
+                if chunk_data["patient"] == patient:
+                    relevant_chunks.append(chunk_data["text"])
+                    scores.append(float(dist))
+
+            if not relevant_chunks:
+                return f"No relevant chunks found for '{patient}' (even though index exists)."
+
+            # Sort by distance (lower = better)
+            sorted_pairs = sorted(zip(relevant_chunks, scores), key=lambda x: x[1])
+            context_chunks = [text for text, _ in sorted_pairs[:4]]  # top 4
+
+            context = "\n\n───\n\n".join(context_chunks)
+
+            prompt = f"""You are a helpful clinical assistant.
+Use **only** the following context from the patient's report.
+If the information is not in the context, say so.
+
+Context:
+{context}
 
 Question: {question}
 
-Answer clinically and concisely, using only the provided context:"""
+Answer concisely and clinically:"""
 
-    return call_llm([{"role": "user", "content": prompt}])
+            return call_llm([{"role": "user", "content": prompt}])
+
+        except Exception as e:
+            return f"Error during retrieval: {str(e)}"
 
 
 # ───────────────────────────────────────────────
