@@ -12,3 +12,4 @@ typing_extensions==4.7.1
 pysqlite3-binary
 plotly
 python-dotenv
+typing_extensions==4.7.1
