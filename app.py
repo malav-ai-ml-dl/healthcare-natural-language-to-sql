@@ -69,15 +69,20 @@ def generate_sql(question):
 # RAG VECTOR DB
 # -------------------------------------------------------
 @st.cache_resource
+@st.cache_resource
 def get_vector_db():
     embeddings = AzureOpenAIEmbeddings(
-        azure_endpoint="https://makeathonmj-ai.openai.azure.com/",
+        model="text-embedding-3-small",
+        azure_endpoint="https://makeathonmj-ai.openai.azure.com",
         api_key=API_KEY,
         azure_deployment="text-embedding-3-small"
     )
-    return Chroma(collection_name="reports", embedding_function=embeddings, persist_directory="chroma_reports")
 
-vector_db = get_vector_db()
+    return Chroma(
+        collection_name="reports",
+        embedding_function=embeddings,
+        persist_directory="chroma_reports"
+    )
 
 def extract_pdf(pdf):
     with pdfplumber.open(pdf) as p:
