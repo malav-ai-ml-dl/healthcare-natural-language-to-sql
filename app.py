@@ -11,19 +11,18 @@ from langchain_community.vectorstores import Chroma
 from langchain_openai import AzureOpenAIEmbeddings
 import plotly.express as px
 
-
 # -------------------------------------------------------
 # GLOBAL CONFIG
 # -------------------------------------------------------
 st.set_page_config(page_title="Healthcare AI Assistant", page_icon="🏥", layout="wide")
 
 API_KEY = st.secrets["AZURE_OPENAI_API_KEY"]
+
 LLM_ENDPOINT = (
     "https://makeathonmj-ai.openai.azure.com/"
     "openai/deployments/gpt-4o-mini-deploy/chat/completions"
     "?api-version=2025-01-01-preview"
 )
-
 
 # -------------------------------------------------------
 # LLM CALL
@@ -35,7 +34,6 @@ def call_llm(messages):
     if r.status_code != 200:
         raise Exception(r.text)
     return r.json()["choices"][0]["message"]["content"]
-
 
 # -------------------------------------------------------
 # STRICT SQL PROMPT
@@ -57,45 +55,20 @@ patients(id, name, age, gender)
 visits(id, patient_id, visit_date, reason)
 medications(id, patient_id, medication)
 
-GOOD EXAMPLES:
-Q: How many patients?
-A:
-SELECT COUNT(*) AS count FROM patients;
-
-Q: Show all male patients.
-A:
-SELECT * FROM patients WHERE gender='M';
-
-Q: How many male and female patients?
-A:
-SELECT gender, COUNT(*) AS count FROM patients GROUP BY gender;
-
-Q: Which patient has the most medications?
-A:
-SELECT p.name, COUNT(m.medication) AS count
-FROM patients p
-JOIN medications m ON p.id = m.patient_id
-GROUP BY p.name
-ORDER BY count DESC;
-
 NOW WRITE THE SQL ONLY for this question:
 {question}
 
 SQL:
 """
 
-
 def generate_sql(question):
     prompt = SQL_PROMPT.format(question=question)
     sql = call_llm([{"role": "user", "content": prompt}]).strip()
     sql = sql.replace("```", "").replace("`", "").strip()
-
-    forbidden = ["DROP", "DELETE", "UPDATE", "INSERT", "ALTER"]
+    forbidden = ["DROP", "DELETE", "ALTER", "UPDATE", "INSERT"]
     if any(f in sql.upper() for f in forbidden):
         raise Exception("Unsafe SQL detected.")
-
     return sql
-
 
 # -------------------------------------------------------
 # VECTOR DB (RAG)
@@ -103,21 +76,19 @@ def generate_sql(question):
 @st.cache_resource
 def init_vector_db():
     embeddings = AzureOpenAIEmbeddings(
-        model="text-embedding-3-small",
         azure_endpoint="https://makeathonmj-ai.openai.azure.com",
-        api_key=API_KEY,
-        azure_deployment="text-embedding-3-small"
+        openai_api_key=API_KEY,                 # FIXED NAME
+        azure_deployment="text-embedding-3-small",
+        api_version="2023-05-15"
     )
 
     return Chroma(
         collection_name="reports",
         embedding_function=embeddings,
-        persist_directory="chroma_reports"
+        persist_directory="/tmp/chroma_reports"   # FIXED FOR STREAMLIT CLOUD
     )
 
-
 vector_db = init_vector_db()
-
 
 def extract_pdf(pdf):
     with pdfplumber.open(pdf) as p:
@@ -125,23 +96,20 @@ def extract_pdf(pdf):
             page.extract_text() for page in p.pages if page.extract_text()
         )
 
-
 def embed_report(text, patient):
     splitter = RecursiveCharacterTextSplitter(chunk_size=800, chunk_overlap=100)
     chunks = splitter.split_text(text)
     vector_db.add_texts(chunks, metadatas=[{"patient": patient}] * len(chunks))
     vector_db.persist()
 
-
 def ask_report(question, patient):
     docs = vector_db.similarity_search(question, k=3, filter={"patient": patient})
     if not docs:
-        return "No report information found."
+        return "No relevant report data found."
 
     context = "\n\n".join(doc.page_content for doc in docs)
     prompt = f"Context:\n{context}\n\nQuestion: {question}\nAnswer clinically:"
     return call_llm([{"role": "user", "content": prompt}])
-
 
 # -------------------------------------------------------
 # AUTO CHART ENGINE
@@ -188,7 +156,6 @@ def auto_chart(df):
     elif chart_type == "Scatter" and len(numeric) >= 2:
         st.plotly_chart(px.scatter(df, x=numeric[0], y=numeric[1]), use_container_width=True)
 
-
 # -------------------------------------------------------
 # SIDEBAR: DB CONNECTION
 # -------------------------------------------------------
@@ -202,14 +169,13 @@ db_name = st.sidebar.text_input("SQLite DB Name:", "demo_healthcare.db")
 if st.sidebar.button("Connect"):
     try:
         engine = create_engine(f"sqlite:///{db_name}")
-        pd.read_sql("SELECT name FROM sqlite_master", engine)  # test
+        pd.read_sql("SELECT name FROM sqlite_master", engine)
         st.session_state.engine = engine
         st.sidebar.success("Connected!")
     except Exception as e:
         st.sidebar.error(str(e))
 
 engine = st.session_state.engine
-
 
 # -------------------------------------------------------
 # NAVIGATION
@@ -220,14 +186,12 @@ page = st.sidebar.radio(
     ["🏠 Home", "🧠 SQL Assistant", "📄 Patient RAG", "📘 DB Viewer"]
 )
 
-
 # -------------------------------------------------------
 # HOME PAGE
 # -------------------------------------------------------
 if page == "🏠 Home":
     st.title("🏥 Healthcare AI Assistant")
-    st.write("AI-powered SQL generation + Clinical RAG + Data exploration.")
-
+    st.write("AI-powered SQL generation • Clinical RAG • Data Exploration")
 
 # -------------------------------------------------------
 # SQL ASSISTANT
@@ -248,7 +212,7 @@ elif page == "🧠 SQL Assistant":
         "How many female patients?",
         "Which patient has the most medications?",
         "List all visits by visit_date.",
-        "Show patient count grouped by age.",
+        "Show patient count grouped by age."
     ]
 
     cols = st.columns(3)
@@ -282,7 +246,6 @@ elif page == "🧠 SQL Assistant":
             with tab3:
                 st.code(item["sql"], language="sql")
 
-
 # -------------------------------------------------------
 # PATIENT RAG
 # -------------------------------------------------------
@@ -302,7 +265,6 @@ elif page == "📄 Patient RAG":
         ans = ask_report(q, patient)
         st.write("### 🧠 Clinical Insight")
         st.write(ans)
-
 
 # -------------------------------------------------------
 # DB VIEWER
