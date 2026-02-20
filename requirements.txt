@@ -1,30 +1,15 @@
-streamlit==1.32.2
-pandas==2.2.1
+streamlit==1.42.0
+pandas==2.2.2
 requests==2.31.0
-sqlalchemy==2.0.29
+sqlalchemy==2.0.25
 pdfplumber==0.11.0
-plotly==5.20.0
 
-# ---------------------------
-# LANGCHAIN + AZURE + CHROMA
-# ---------------------------
-langchain==0.1.16
-langchain-community==0.0.37
-langchain-openai==0.1.1
-langchain-text-splitters==0.0.2
+langchain==0.2.5
+langchain-community==0.2.5
+langchain-openai==0.1.7
+langchain-text-splitters==0.2.2
 
-chromadb==0.4.24
-
-# ---------------------------
-# CRITICAL: OpenAI 1.x REQUIRED
-# ---------------------------
-# (for AzureOpenAIEmbeddings to work)
-openai==1.12.0
-
-# ---------------------------
-# Pydantic v1 for LangChain compatibility
-# ---------------------------
-pydantic==1.10.13
-
-tiktoken==0.5.2
-pysqlite3-binary
+chromadb==0.5.4
+plotly==5.22.0
+pydantic==1.10.15
+tiktoken==0.7.0
