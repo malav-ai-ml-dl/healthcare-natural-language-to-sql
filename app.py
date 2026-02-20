@@ -41,18 +41,62 @@ def call_llm(messages):
 # SQL PROMPT
 # -------------------------------------------------------
 SQL_PROMPT = """
-You are an expert SQL generator for a SQLite healthcare database.
+You are an expert SQL generator for a **SQLite healthcare database**.
+
+Your job: Convert ANY natural-language question into **correct SQL**.
 
 STRICT RULES:
-- Output ONLY valid SQL.
-- Do NOT explain.
-- No markdown or backticks.
-- Do NOT invent tables or columns.
+1. Output ONLY SQL — no text, no explanation, no markdown, no comments.
+2. Use ONLY the tables and columns in the schema.
+3. Never invent new tables, columns, or relationships.
+4. Always use valid SQLite syntax.
+5. If the user asks:
+   - “list”, “show”, “display”, “get” → return **full rows**
+   - “how many”, “count”, “number of” → return **aggregations**
+6. For gender queries:
+   - Use gender = 'M' or gender = 'F'
+7. For joins, ALWAYS join using patient_id = patients.id
+8. For aggregation with details, use GROUP BY.
+9. For date-based queries, use visits.visit_date.
 
 SCHEMA:
 patients(id, name, age, gender)
 visits(id, patient_id, visit_date, reason)
 medications(id, patient_id, medication)
+
+EXAMPLES YOU MUST FOLLOW:
+
+Q: How many patients are there?
+SQL:
+SELECT COUNT(*) AS total_patients FROM patients;
+
+Q: Show all male patients.
+SQL:
+SELECT * FROM patients WHERE gender = 'M';
+
+Q: How many male and female patients?
+SQL:
+SELECT gender, COUNT(*) AS patient_count FROM patients GROUP BY gender;
+
+Q: Which patient has the most medications?
+SQL:
+SELECT p.name, COUNT(m.medication) AS medication_count
+FROM patients p
+JOIN medications m ON p.id = m.patient_id
+GROUP BY p.name
+ORDER BY medication_count DESC
+LIMIT 1;
+
+Q: List all visits by date.
+SQL:
+SELECT * FROM visits ORDER BY visit_date;
+
+Q: Show patients with their visit reasons.
+SQL:
+SELECT p.name, v.reason, v.visit_date
+FROM patients p
+JOIN visits v ON p.id = v.patient_id
+ORDER BY v.visit_date;
 
 USER QUESTION:
 {question}
