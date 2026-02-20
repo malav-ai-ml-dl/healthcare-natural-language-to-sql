@@ -1,237 +1,321 @@
 import streamlit as st
 import pandas as pd
-import sqlite3
+import json
+import requests
+import pdfplumber
 from pathlib import Path
 from sqlalchemy import create_engine, text
+from langchain_text_splitters import RecursiveCharacterTextSplitter
+from langchain_community.vectorstores import Chroma
+from langchain_openai import AzureOpenAIEmbeddings
+import plotly.express as px
 
-from langchain_core.prompts import PromptTemplate
-from langchain_core.runnables import RunnablePassthrough
-from langchain_core.output_parsers import StrOutputParser
-from langchain_community.utilities import SQLDatabase
-from langchain_groq import ChatGroq
+# -------------------------------------------------------
+# GLOBAL CONFIG
+# -------------------------------------------------------
+st.set_page_config(page_title="Healthcare AI Assistant", page_icon="🏥", layout="wide")
 
-# --- Page Configuration ---
-st.set_page_config(
-    page_title="Healthcare NL→SQL",
-    page_icon="🏥",
-    layout="wide"
+API_ENDPOINT = (
+    "https://makeathonmj-ai.openai.azure.com/"
+    "openai/deployments/gpt-4o-mini-deploy/chat/completions"
+    "?api-version=2025-01-01-preview"
 )
-
-# --- UI Header ---
-st.markdown("""
-    <style>
-    .header {
-        background-color: #2e3b4e;
-        color: white;
-        padding: 20px;
-        border-radius: 10px;
-        text-align: center;
-        margin-bottom: 20px;
-    }
-    .header h1 {
-        font-size: 2.5em;
-        margin: 0;
-    }
-    .header p {
-        font-size: 1.1em;
-        margin-top: 10px;
-    }
-    </style>
-    <div class="header">
-        <h1>🏥 Healthcare: Natural Language to SQL</h1>
-        <p>Your AI-powered assistant for clinical research data analysis.</p>
-    </div>
-""", unsafe_allow_html=True)
+API_KEY = st.secrets["AZURE_OPENAI_API_KEY"]
 
 
-# ------------------ Sidebar Content (No API key input needed) ------------------
-with st.sidebar:
-    st.sidebar.title("About")
-    st.sidebar.info(
-        "This application uses AI to translate plain English questions "
-        "into SQL queries, allowing clinical researchers to interact with "
-        "patient data intuitively and in real-time."
-    )
-    
-    st.sidebar.title("How to Use")
-    st.sidebar.markdown(
-        """
-        1.  Ask a question about the data in the chat box.
-        2.  View the results in the organized tabs.
-        3.  Click "Clear message history" to start over.
-        """
-    )
+# -------------------------------------------------------
+# LLM CALL
+# -------------------------------------------------------
+def call_llm(messages):
+    headers = {"Content-Type": "application/json", "api-key": API_KEY}
+    payload = {"messages": messages, "temperature": 0, "max_tokens": 1500}
 
-# ------------------ LLM Configuration ------------------
-# MODIFIED: API key is now loaded securely from st.secrets
-try:
-    api_key = st.secrets["GROQ_API_KEY"]
-except KeyError:
-    st.error("Groq API key not found. Please add it to your .streamlit/secrets.toml file.")
-    st.stop()
+    res = requests.post(API_ENDPOINT, headers=headers, data=json.dumps(payload))
+    if res.status_code != 200:
+        raise Exception(res.text)
 
-llm = ChatGroq(
-    model="llama-3.1-8b-instant",
-    temperature=0,
-    api_key=api_key,
-    max_tokens=2048
-)
+    return res.json()["choices"][0]["message"]["content"]
 
-# ------------------ Database Configuration ------------------
-@st.cache_resource
-def get_db():
-    db_filepath = (Path(__file__).parent / "healthcare.db").absolute()
-    if not db_filepath.exists():
-        st.error(f"Database file not found at: {db_filepath}")
-        st.stop()
-    creator = lambda: sqlite3.connect(f"file:{db_filepath}?mode=ro", uri=True)
-    engine = create_engine("sqlite:///", creator=creator)
-    custom_table_info = {
-        "patients": "Contains demographic information about each patient (id, name, age, gender). The gender column uses 'M' for male and 'F' for female.",
-        "visits": "Records patient visits, including the date and reason for the visit. Links to patients by patient_id.",
-        "medications": "Lists medications prescribed to patients. Links to patients by patient_id. The column is named 'medication'."
-    }
-    return SQLDatabase(engine, custom_table_info=custom_table_info)
 
-try:
-    db = get_db()
-except Exception as e:
-    st.error(f"Failed to connect to the database: {str(e)}")
-    st.stop()
+# -------------------------------------------------------
+# SQL PROMPT
+# -------------------------------------------------------
+SQL_PROMPT = """
+You are an expert SQL generator for a SQLite healthcare database.
 
-# ------------------ Prompt Template ------------------
-# MODIFIED: Added instruction to use aliases and updated examples.
-PROMPT_TEMPLATE = """
-You are an expert SQLite data analyst. Your task is to convert a user's question in plain English into a valid SQLite query.
+STRICT RULES:
+- Output ONLY valid SQL.
+- Do NOT explain.
+- No markdown or backticks.
+- Do NOT invent tables or columns.
 
-**Instructions:**
-1.  You must only output the SQL query. Do not include any other text, explanations, or markdown.
-2.  When using aggregate functions (COUNT, AVG, etc.), always give the calculated column a simple, clear alias using `AS`. For example, `COUNT(*) AS total_count`.
-3.  Analyze the database schema below to understand the available tables and columns.
-4.  Pay close attention to the user's question to identify the key entities and relationships required for the query.
-5.  Use the provided few-shot examples as a guide for constructing correct queries.
+SCHEMA:
+patients(id, name, age, gender)
+visits(id, patient_id, visit_date, reason)
+medications(id, patient_id, medication)
 
-**Database Schema:**
-{table_info}
-
-**Few-shot Examples:**
--- Question: How many patients are there for each gender?
--- SQL: SELECT gender, COUNT(*) AS patient_count FROM patients GROUP BY gender;
-
--- Question: Show me all the male patients.
--- SQL: SELECT * FROM patients WHERE gender = 'M';
-
--- Question: What was the reason for Alice Smith's latest visit?
--- SQL: SELECT T2.reason FROM patients AS T1 JOIN visits AS T2 ON T1.id = T2.patient_id WHERE T1.name = 'Alice Smith' ORDER BY T2.visit_date DESC LIMIT 1;
-
--- Question: Show the number of medications per patient.
--- SQL: SELECT T1.name, COUNT(T2.medication) AS medication_count FROM patients AS T1 JOIN medications AS T2 ON T1.id = T2.patient_id GROUP BY T1.name;
-
-**User Question:**
+USER QUESTION:
 {question}
 
-**SQL Query:**
+SQL:
 """
 
-prompt = PromptTemplate(
-    input_variables=["question", "table_info"],
-    template=PROMPT_TEMPLATE,
-)
+def generate_sql(question):
+    raw = call_llm([{"role": "user", "content": SQL_PROMPT.format(question=question)}])
+    return raw.replace("```", "").strip()
 
-# ------------------ LangChain Execution Chain ------------------
-generate_query_chain = (
-    RunnablePassthrough.assign(table_info=lambda x: db.get_table_info())
-    | prompt
-    | llm
-    | StrOutputParser()
-)
 
-# --- Reusable function to display results in tabs ---
-def display_results(df, sql_query):
-    with st.container(border=True):
-        tab_table, tab_chart, tab_sql = st.tabs(["📊 Table", "📈 Chart", "🔍 SQL"])
-        
-        with tab_table:
-            st.dataframe(df, use_container_width=True)
-        
-        with tab_sql:
-            st.code(sql_query, language="sql")
-        
-        with tab_chart:
-            try:
-                if df.shape == (1, 1):
-                    st.metric("Result", df.iloc[0, 0])
-                elif len(df.columns) == 2 and pd.api.types.is_numeric_dtype(df.iloc[:, 1]):
-                    st.bar_chart(df, x=df.columns[0], y=df.columns[1])
-                else:
-                    st.info("A chart can't be automatically generated for this data.")
-            except Exception as e:
-                st.warning(f"Could not generate chart: {e}")
+# -------------------------------------------------------
+# RAG VECTOR DB
+# -------------------------------------------------------
+@st.cache_resource
+def get_vector_db():
+    embeddings = AzureOpenAIEmbeddings(
+        azure_endpoint="https://makeathonmj-ai.openai.azure.com/",
+        api_key=API_KEY,
+        azure_deployment="text-embedding-3-small"
+    )
+    return Chroma(collection_name="reports", embedding_function=embeddings, persist_directory="chroma_reports")
 
-# --- Initialize Chat History ---
-if "messages" not in st.session_state:
-    st.session_state["messages"] = [{"role": "assistant", "content": "Hello! Ask a question about the healthcare data or try one of the examples below."}]
+vector_db = get_vector_db()
 
-# --- Example Questions ---
-example_questions = [
-    "How many patients are there?",
-    "Which patients are on the most medications?",
-    "Show me all the male patients.",
-    "What was the reason for Alice Smith's latest visit?"
-]
+def extract_pdf(pdf):
+    with pdfplumber.open(pdf) as p:
+        return "\n".join([pg.extract_text() for pg in p.pages if pg.extract_text()])
 
-def set_query_from_example(question):
-    st.session_state.user_query_from_button = question
+def embed_report(text, patient):
+    splitter = RecursiveCharacterTextSplitter(chunk_size=700, chunk_overlap=100)
+    chunks = splitter.split_text(text)
+    vector_db.add_texts(chunks, metadatas=[{"patient": patient}] * len(chunks))
+    vector_db.persist()
 
-st.write("### Example Questions")
-cols = st.columns(len(example_questions))
-for i, question in enumerate(example_questions):
-    with cols[i]:
-        if st.button(question, use_container_width=True, on_click=set_query_from_example, args=[question]):
-            pass
+def answer_report(q, patient):
+    docs = vector_db.similarity_search(q, k=3, filter={"patient": patient})
+    if not docs:
+        return "No report data found."
 
-st.markdown("---")
+    context = "\n\n".join([d.page_content for d in docs])
+    prompt = f"Context:\n{context}\n\nQuestion: {q}\nAnswer clinically:"
+    return call_llm([{"role": "user", "content": prompt}])
 
-# ------------------ Chat UI ------------------
-# Display existing chat messages
-for msg in st.session_state.messages:
-    with st.chat_message(msg["role"]):
-        if isinstance(msg["content"], dict) and "is_result" in msg["content"]:
-            display_results(msg["content"]["df"], msg["content"]["sql"])
-        else:
-            st.write(msg["content"])
 
-# Handle new user input
-if user_query := st.chat_input(placeholder="Ask about patients, visits, or medications...", key="main_chat_input") or st.session_state.get("user_query_from_button"):
-    st.session_state.messages.append({"role": "user", "content": user_query})
-    with st.chat_message("user"):
-        st.write(user_query)
-    
-    with st.chat_message("assistant"):
-        with st.spinner("Thinking..."):
-            try:
-                sql_query = generate_query_chain.invoke({"question": user_query})
-                engine = db._engine
-                
-                with engine.connect() as connection:
-                    result = connection.execute(text(sql_query))
-                    columns = result.keys()
-                    rows = result.fetchall()
+# -------------------------------------------------------
+# SMART CHART ENGINE
+# -------------------------------------------------------
+def auto_chart(df):
+    numeric = df.select_dtypes(include="number").columns.tolist()
+    text = df.select_dtypes(include="object").columns.tolist()
+    cols = df.columns
 
-                if rows:
-                    df = pd.DataFrame(rows, columns=columns)
-                    result_data = {"is_result": True, "df": df, "sql": sql_query}
-                    st.session_state.messages.append({"role": "assistant", "content": result_data})
-                    display_results(df, sql_query)
-                else:
-                    response = "The query returned no results."
-                    st.session_state.messages.append({"role": "assistant", "content": response})
-                    st.write(response)
+    # 1) Single metric
+    if df.shape == (1,1):
+        st.metric(df.columns[0], df.iloc[0,0])
+        return
 
-            except Exception as e:
-                error_message = f"An error occurred: {str(e)}"
-                st.session_state.messages.append({"role": "assistant", "content": error_message})
-                st.error(error_message)
-    
-    if "user_query_from_button" in st.session_state:
-        del st.session_state["user_query_from_button"]
+    chart_type = st.selectbox(
+        "Select chart type:",
+        ["Auto", "Bar Chart", "Line Chart", "Pie Chart", "Scatter"],
+        key=str(cols)
+    )
+
+    def title(x, y=None):
+        return f"{y} by {x}" if y else x
+
+    if chart_type == "Auto":
+        # A) date → line
+        date_cols = [c for c in cols if "date" in c.lower()]
+        if date_cols and numeric:
+            fig = px.line(df, x=date_cols[0], y=numeric)
+            st.plotly_chart(fig, use_container_width=True)
+            return
+
+        # B) category + numeric → bar
+        if len(text) == 1 and len(numeric) == 1:
+            fig = px.bar(df, x=text[0], y=numeric[0])
+            st.plotly_chart(fig, use_container_width=True)
+            return
+
+        # C) numeric discrete (like age) → bar
+        if len(numeric) == 2 and df[numeric[0]].nunique() <= 50:
+            fig = px.bar(df, x=numeric[0], y=numeric[1])
+            st.plotly_chart(fig, use_container_width=True)
+            return
+
+        # D) multi numeric → line
+        if len(numeric) >= 2:
+            fig = px.line(df[numeric])
+            st.plotly_chart(fig, use_container_width=True)
+            return
+
+        st.info("No suitable visualization.")
+        return
+
+    # MANUAL MODES
+    if chart_type == "Bar Chart" and len(numeric) >= 1:
+        fig = px.bar(df, x=cols[0], y=numeric[-1])
+        st.plotly_chart(fig, use_container_width=True)
+        return
+
+    if chart_type == "Line Chart" and len(numeric) >= 1:
+        fig = px.line(df, x=cols[0], y=numeric)
+        st.plotly_chart(fig, use_container_width=True)
+        return
+
+    if chart_type == "Pie Chart" and len(text) >= 1 and len(numeric) >= 1:
+        fig = px.pie(df, names=text[0], values=numeric[-1])
+        st.plotly_chart(fig, use_container_width=True)
+        return
+
+    if chart_type == "Scatter" and len(numeric) >= 2:
+        fig = px.scatter(df, x=numeric[0], y=numeric[1])
+        st.plotly_chart(fig, use_container_width=True)
+        return
+
+
+# -------------------------------------------------------
+# DATABASE SETUP (SQLite only)
+# -------------------------------------------------------
+if "engine" not in st.session_state:
+    st.session_state.engine = None
+
+st.sidebar.title("🗄 Database Setup")
+
+db_name = st.sidebar.text_input("Enter SQLite DB name:", "demo_healthcare.db")
+
+if st.sidebar.button("Connect Database"):
+    try:
+        engine = create_engine(f"sqlite:///{db_name}")
+        # test query
+        pd.read_sql("SELECT name FROM sqlite_master", engine)
+        st.session_state.engine = engine
+        st.sidebar.success(f"Connected to {db_name}")
+    except Exception as e:
+        st.sidebar.error(str(e))
+
+engine = st.session_state.engine
+
+
+# -------------------------------------------------------
+# SIDEBAR NAVIGATION
+# -------------------------------------------------------
+st.sidebar.title("📌 Navigation")
+page = st.sidebar.radio("Go to:", ["🏠 Home", "🧠 SQL Assistant", "📄 Patient RAG", "📘 Database Viewer"])
+
+
+# -------------------------------------------------------
+# HOME PAGE
+# -------------------------------------------------------
+if page == "🏠 Home":
+    st.markdown("""
+    <h1 style='text-align:center'>🏥 Healthcare AI Assistant</h1>
+    <p style='text-align:center;font-size:18px'>
+        Natural Language SQL + Clinical RAG + Database Viewer  
+    </p>
+    """, unsafe_allow_html=True)
+
+    st.info("👉 Set up your database in the sidebar first!")
+
+
+# -------------------------------------------------------
+# SQL ASSISTANT
+# -------------------------------------------------------
+elif page == "🧠 SQL Assistant":
+    st.title("🧠 Natural Language → SQL Assistant")
+
+    if engine is None:
+        st.warning("⚠ Connect a SQLite DB first from the sidebar.")
+        st.stop()
+
+    if "history" not in st.session_state:
+        st.session_state.history = []
+
+    st.write("### 🔍 Example Questions")
+    examples = [
+        "How many patients are there?",
+        "Show all male patients.",
+        "How many male and female patients?",
+        "Which patient has the most medications?",
+        "Show patient count grouped by age.",
+        "List all visits by date."
+    ]
+
+    cols = st.columns(3)
+    for i, q in enumerate(examples):
+        with cols[i % 3]:
+            if st.button(q):
+                sql = generate_sql(q)
+                df = pd.read_sql(text(sql), engine)
+                st.session_state.history.append({"q": q, "sql": sql, "df": df})
+                st.rerun()
+
+    st.markdown("---")
+
+    q = st.chat_input("Ask something about your data...")
+    if q:
+        sql = generate_sql(q)
+        df = pd.read_sql(text(sql), engine)
+        st.session_state.history.append({"q": q, "sql": sql, "df": df})
+        st.rerun()
+
+    for item in st.session_state.history:
+        with st.container(border=True):
+            st.subheader(f"❓ {item['q']}")
+            df = item["df"]
+
+            res, chart, sqltab = st.tabs(["📊 Result", "📈 Chart", "🧾 SQL"])
+
+            with res:
+                st.dataframe(df, use_container_width=True)
+
+            with chart:
+                auto_chart(df)
+
+            with sqltab:
+                st.code(item["sql"], language="sql")
+
+
+# -------------------------------------------------------
+# PATIENT RAG
+# -------------------------------------------------------
+elif page == "📄 Patient RAG":
+    st.title("📄 Patient Report Intelligence (RAG)")
+
+    col1, col2 = st.columns(2)
+    with col1:
+        pdf = st.file_uploader("Upload patient PDF", type=["pdf"])
+    with col2:
+        patient = st.text_input("Patient Name")
+
+    if pdf and patient:
+        text = extract_pdf(pdf)
+        embed_report(text, patient)
+        st.success("Report embedded!")
+
+    q = st.text_input("Ask a question about this patient report:")
+    if q and patient:
+        with st.spinner("Analyzing..."):
+            ans = answer_report(q, patient)
+        st.write("### 🧠 Clinical Insight")
+        st.write(ans)
+
+
+# -------------------------------------------------------
+# DATABASE VIEWER
+# -------------------------------------------------------
+elif page == "📘 Database Viewer":
+    st.title("📘 Database Viewer")
+
+    if engine is None:
+        st.warning("⚠ Connect a SQLite DB first from the sidebar.")
+        st.stop()
+
+    tables = pd.read_sql("SELECT name FROM sqlite_master WHERE type='table'", engine)["name"].tolist()
+
+    if not tables:
+        st.info("No tables found in this database.")
+        st.stop()
+
+    for t in tables:
+        st.subheader(f"📌 {t}")
+        df = pd.read_sql(f"SELECT * FROM {t}", engine)
+        st.dataframe(df, use_container_width=True)
