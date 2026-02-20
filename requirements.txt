@@ -5,27 +5,25 @@ sqlalchemy==2.0.29
 pdfplumber==0.11.0
 plotly==5.20.0
 
-# ------------------------
-# CORE LANGCHAIN
-# ------------------------
+# ---------------------------
+# LANGCHAIN + AZURE + CHROMA
+# ---------------------------
 langchain==0.1.16
 langchain-community==0.0.37
 langchain-openai==0.1.1
 langchain-text-splitters==0.0.2
 
-# ------------------------
-# VECTOR DB (WORKING)
-# ------------------------
 chromadb==0.4.24
 
-# ------------------------
-# OPENAI SDK 1.x
-# ------------------------
+# ---------------------------
+# CRITICAL: OpenAI 1.x REQUIRED
+# ---------------------------
+# (for AzureOpenAIEmbeddings to work)
 openai==1.12.0
 
-# ------------------------
-# REQUIRED FOR LANGCHAIN COMPATIBILITY
-# ------------------------
+# ---------------------------
+# Pydantic v1 for LangChain compatibility
+# ---------------------------
 pydantic==1.10.13
 
 tiktoken==0.5.2
