@@ -1,6 +1,3 @@
-Deployment sucessfull , but not giving list of male or female patients
-
-
 import streamlit as st
 import pandas as pd
 import json
