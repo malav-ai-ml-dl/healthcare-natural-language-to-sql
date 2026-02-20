@@ -3,6 +3,7 @@ import pandas as pd
 import json
 import requests
 import pdfplumber
+from pathlib import Path
 from sqlalchemy import create_engine, text
 
 from langchain_text_splitters import RecursiveCharacterTextSplitter
@@ -12,69 +13,72 @@ import plotly.express as px
 
 
 # -------------------------------------------------------
-# STREAMLIT CONFIG
+# GLOBAL CONFIG
 # -------------------------------------------------------
 st.set_page_config(page_title="Healthcare AI Assistant", page_icon="🏥", layout="wide")
 
 API_KEY = st.secrets["AZURE_OPENAI_API_KEY"]
-BASE_URL = "https://makeathonmj-ai.openai.azure.com"
-
 LLM_ENDPOINT = (
-    f"{BASE_URL}/openai/deployments/gpt-4o-mini-deploy/chat/completions"
+    "https://makeathonmj-ai.openai.azure.com/"
+    "openai/deployments/gpt-4o-mini-deploy/chat/completions"
     "?api-version=2025-01-01-preview"
 )
 
 
 # -------------------------------------------------------
-# LLM CALLER
+# LLM CALL
 # -------------------------------------------------------
-def call_llm(messages, max_tokens=1200):
+def call_llm(messages):
     headers = {"Content-Type": "application/json", "api-key": API_KEY}
-    payload = {"messages": messages, "temperature": 0, "max_tokens": max_tokens}
-
+    payload = {"messages": messages, "temperature": 0, "max_tokens": 1200}
     r = requests.post(LLM_ENDPOINT, headers=headers, data=json.dumps(payload))
     if r.status_code != 200:
         raise Exception(r.text)
-
     return r.json()["choices"][0]["message"]["content"]
 
 
 # -------------------------------------------------------
-# STRICT SQL GENERATOR
+# STRICT SQL PROMPT
 # -------------------------------------------------------
 SQL_PROMPT = """
-You are an expert SQL generator for a STRICT SQLite healthcare database.
+You are a SQL generator for a STRICT SQLite healthcare database.
 
 RULES:
-- Return ONLY executable SQL.
-- No markdown, no explanation, no commentary.
+- Return ONLY executable SQL (no explanation, no markdown).
 - Do NOT hallucinate tables or columns.
-- Gender is ONLY 'M' or 'F'.
-- Use correct table/column names.
+- Gender values are ONLY 'M' or 'F'.
+- Use COUNT(*) AS count for counting.
+- Use GROUP BY when grouping.
+- Use SELECT * for listing rows.
+- Use correct table and column names exactly as below.
 
-DATABASE SCHEMA:
+SCHEMA:
 patients(id, name, age, gender)
 visits(id, patient_id, visit_date, reason)
 medications(id, patient_id, medication)
 
-EXAMPLES:
-Q: Show all male patients.
-SELECT * FROM patients WHERE gender='M';
-
+GOOD EXAMPLES:
 Q: How many patients?
+A:
 SELECT COUNT(*) AS count FROM patients;
 
+Q: Show all male patients.
+A:
+SELECT * FROM patients WHERE gender='M';
+
 Q: How many male and female patients?
+A:
 SELECT gender, COUNT(*) AS count FROM patients GROUP BY gender;
 
-Q: Patients with most medications.
+Q: Which patient has the most medications?
+A:
 SELECT p.name, COUNT(m.medication) AS count
 FROM patients p
 JOIN medications m ON p.id = m.patient_id
 GROUP BY p.name
 ORDER BY count DESC;
 
-NOW generate SQL ONLY for this question:
+NOW WRITE THE SQL ONLY for this question:
 {question}
 
 SQL:
@@ -84,26 +88,23 @@ SQL:
 def generate_sql(question):
     prompt = SQL_PROMPT.format(question=question)
     sql = call_llm([{"role": "user", "content": prompt}]).strip()
-
-    # Cleanup
     sql = sql.replace("```", "").replace("`", "").strip()
 
-    # Prevent unsafe SQL
     forbidden = ["DROP", "DELETE", "UPDATE", "INSERT", "ALTER"]
-    if any(x in sql.upper() for x in forbidden):
+    if any(f in sql.upper() for f in forbidden):
         raise Exception("Unsafe SQL detected.")
 
     return sql
 
 
 # -------------------------------------------------------
-# RAG – VECTOR DB INITIALIZATION
+# VECTOR DB (RAG)
 # -------------------------------------------------------
 @st.cache_resource
 def init_vector_db():
     embeddings = AzureOpenAIEmbeddings(
         model="text-embedding-3-small",
-        azure_endpoint=BASE_URL,
+        azure_endpoint="https://makeathonmj-ai.openai.azure.com",
         api_key=API_KEY,
         azure_deployment="text-embedding-3-small"
     )
@@ -118,43 +119,32 @@ def init_vector_db():
 vector_db = init_vector_db()
 
 
-# -------------------------------------------------------
-# PDF EXTRACT
-# -------------------------------------------------------
-def extract_pdf(file):
-    with pdfplumber.open(file) as pdf:
+def extract_pdf(pdf):
+    with pdfplumber.open(pdf) as p:
         return "\n".join(
-            pg.extract_text() for pg in pdf.pages if pg.extract_text()
+            page.extract_text() for page in p.pages if page.extract_text()
         )
 
 
-def embed_report(text, patient_name):
-    splitter = RecursiveCharacterTextSplitter(chunk_size=700, chunk_overlap=100)
+def embed_report(text, patient):
+    splitter = RecursiveCharacterTextSplitter(chunk_size=800, chunk_overlap=100)
     chunks = splitter.split_text(text)
-
-    vector_db.add_texts(
-        texts=chunks,
-        metadatas=[{"patient": patient_name}] * len(chunks)
-    )
+    vector_db.add_texts(chunks, metadatas=[{"patient": patient}] * len(chunks))
     vector_db.persist()
 
 
-def ask_report(question, patient_name):
-    docs = vector_db.similarity_search(
-        question, k=3, filter={"patient": patient_name}
-    )
-
+def ask_report(question, patient):
+    docs = vector_db.similarity_search(question, k=3, filter={"patient": patient})
     if not docs:
-        return "No relevant clinical information found."
+        return "No report information found."
 
-    context = "\n\n".join(d.page_content for d in docs)
+    context = "\n\n".join(doc.page_content for doc in docs)
     prompt = f"Context:\n{context}\n\nQuestion: {question}\nAnswer clinically:"
-
     return call_llm([{"role": "user", "content": prompt}])
 
 
 # -------------------------------------------------------
-# AUTO CHARTING
+# AUTO CHART ENGINE
 # -------------------------------------------------------
 def auto_chart(df):
     if df.shape == (1, 1):
@@ -163,20 +153,16 @@ def auto_chart(df):
 
     numeric = df.select_dtypes(include="number").columns.tolist()
     text_cols = df.select_dtypes(include="object").columns.tolist()
-    cols = df.columns.tolist()
+    cols = df.columns
 
-    chart = st.selectbox(
-        "Chart Type:",
-        ["Auto", "Bar", "Line", "Pie", "Scatter"],
-        key=str(cols),
+    chart_type = st.selectbox(
+        "Chart Type:", ["Auto", "Bar", "Line", "Pie", "Scatter"], key=str(cols)
     )
 
-    if chart == "Auto":
-        if any("date" in c.lower() for c in cols) and numeric:
-            st.plotly_chart(
-                px.line(df, x=[c for c in cols if "date" in c.lower()][0], y=numeric),
-                use_container_width=True,
-            )
+    if chart_type == "Auto":
+        date_cols = [c for c in cols if "date" in c.lower()]
+        if date_cols and numeric:
+            st.plotly_chart(px.line(df, x=date_cols[0], y=numeric), use_container_width=True)
             return
 
         if len(text_cols) == 1 and len(numeric) == 1:
@@ -190,32 +176,35 @@ def auto_chart(df):
         st.info("No suitable chart.")
         return
 
-    if chart == "Bar":
-        st.plotly_chart(px.bar(df, x=cols[0], y=numeric[-1]), use_container_width=True)
-    elif chart == "Line":
-        st.plotly_chart(px.line(df, x=cols[0], y=numeric[-1]), use_container_width=True)
-    elif chart == "Pie" and text_cols:
-        st.plotly_chart(px.pie(df, names=text_cols[0], values=numeric[-1]), use_container_width=True)
-    elif chart == "Scatter" and len(numeric) >= 2:
+    if chart_type == "Bar":
+        st.plotly_chart(px.bar(df, x=cols[0], y=df.columns[-1]), use_container_width=True)
+
+    elif chart_type == "Line":
+        st.plotly_chart(px.line(df, x=cols[0], y=df.columns[-1]), use_container_width=True)
+
+    elif chart_type == "Pie" and len(text_cols) >= 1:
+        st.plotly_chart(px.pie(df, names=text_cols[0], values=df.columns[-1]), use_container_width=True)
+
+    elif chart_type == "Scatter" and len(numeric) >= 2:
         st.plotly_chart(px.scatter(df, x=numeric[0], y=numeric[1]), use_container_width=True)
 
 
 # -------------------------------------------------------
-# SIDEBAR DB CONNECTION
+# SIDEBAR: DB CONNECTION
 # -------------------------------------------------------
 st.sidebar.header("🗄 Database Setup")
 
 if "engine" not in st.session_state:
     st.session_state.engine = None
 
-db_name = st.sidebar.text_input("SQLite DB Name", "demo_healthcare.db")
+db_name = st.sidebar.text_input("SQLite DB Name:", "demo_healthcare.db")
 
 if st.sidebar.button("Connect"):
     try:
         engine = create_engine(f"sqlite:///{db_name}")
-        pd.read_sql("SELECT name FROM sqlite_master", engine)
+        pd.read_sql("SELECT name FROM sqlite_master", engine)  # test
         st.session_state.engine = engine
-        st.sidebar.success("Connected successfully!")
+        st.sidebar.success("Connected!")
     except Exception as e:
         st.sidebar.error(str(e))
 
@@ -233,18 +222,18 @@ page = st.sidebar.radio(
 
 
 # -------------------------------------------------------
-# HOME
+# HOME PAGE
 # -------------------------------------------------------
 if page == "🏠 Home":
     st.title("🏥 Healthcare AI Assistant")
-    st.write("Natural language SQL • Clinical RAG • Data Visualization")
+    st.write("AI-powered SQL generation + Clinical RAG + Data exploration.")
 
 
 # -------------------------------------------------------
 # SQL ASSISTANT
 # -------------------------------------------------------
 elif page == "🧠 SQL Assistant":
-    st.title("🧠 Natural Language → SQL Engine")
+    st.title("🧠 Natural Language → SQL Insights")
 
     if engine is None:
         st.warning("Connect a database first.")
@@ -254,29 +243,30 @@ elif page == "🧠 SQL Assistant":
         st.session_state.history = []
 
     st.write("### 🔍 Suggested Questions")
-    suggestions = [
+    sample_q = [
         "Show all male patients.",
         "How many female patients?",
         "Which patient has the most medications?",
         "List all visits by visit_date.",
-        "Show patient count grouped by age."
+        "Show patient count grouped by age.",
     ]
 
     cols = st.columns(3)
-    for i, q in enumerate(suggestions):
-        if cols[i % 3].button(q):
-            sql = generate_sql(q)
-            df = pd.read_sql(text(sql), engine)
-            st.session_state.history.append({"q": q, "sql": sql, "df": df})
-            st.rerun()
+    for i, q in enumerate(sample_q):
+        with cols[i % 3]:
+            if st.button(q):
+                sql = generate_sql(q)
+                df = pd.read_sql(text(sql), engine)
+                st.session_state.history.append({"q": q, "sql": sql, "df": df})
+                st.rerun()
 
     st.write("---")
 
-    user_q = st.chat_input("Ask your own question...")
-    if user_q:
-        sql = generate_sql(user_q)
+    q = st.chat_input("Ask your own question...")
+    if q:
+        sql = generate_sql(q)
         df = pd.read_sql(text(sql), engine)
-        st.session_state.history.append({"q": user_q, "sql": sql, "df": df})
+        st.session_state.history.append({"q": q, "sql": sql, "df": df})
         st.rerun()
 
     for item in st.session_state.history:
@@ -297,17 +287,17 @@ elif page == "🧠 SQL Assistant":
 # PATIENT RAG
 # -------------------------------------------------------
 elif page == "📄 Patient RAG":
-    st.title("📄 Patient Report Intelligence")
+    st.title("📄 Patient Report Intelligence (RAG)")
 
-    pdf = st.file_uploader("Upload Report (PDF)", type=["pdf"])
+    pdf = st.file_uploader("Upload PDF", type=["pdf"])
     patient = st.text_input("Patient Name")
 
     if pdf and patient:
         text = extract_pdf(pdf)
         embed_report(text, patient)
-        st.success("Report embedded successfully!")
+        st.success("Report embedded!")
 
-    q = st.text_input("Ask a clinical question:")
+    q = st.text_input("Ask about this patient report:")
     if q and patient:
         ans = ask_report(q, patient)
         st.write("### 🧠 Clinical Insight")
@@ -324,10 +314,8 @@ elif page == "📘 DB Viewer":
         st.warning("Connect a database first.")
         st.stop()
 
-    tables = pd.read_sql(
-        "SELECT name FROM sqlite_master WHERE type='table'",
-        engine
-    )["name"].tolist()
+    tables = pd.read_sql("SELECT name FROM sqlite_master WHERE type='table'", engine)
+    tables = tables["name"].tolist()
 
     for t in tables:
         st.subheader(f"📌 {t}")
