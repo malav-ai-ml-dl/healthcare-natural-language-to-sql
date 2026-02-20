@@ -113,7 +113,6 @@ def generate_sql(question):
 # RAG VECTOR DB
 # -------------------------------------------------------
 @st.cache_resource
-@st.cache_resource
 def get_vector_db():
     embeddings = AzureOpenAIEmbeddings(
         model="text-embedding-3-small",
@@ -128,25 +127,57 @@ def get_vector_db():
         persist_directory="chroma_reports"
     )
 
+# Initialize vector DB globally
+vector_db = get_vector_db()
+
+
 def extract_pdf(pdf):
     with pdfplumber.open(pdf) as p:
         return "\n".join([pg.extract_text() for pg in p.pages if pg.extract_text()])
 
+
 def embed_report(text, patient):
     splitter = RecursiveCharacterTextSplitter(chunk_size=700, chunk_overlap=100)
     chunks = splitter.split_text(text)
-    vector_db.add_texts(chunks, metadatas=[{"patient": patient}] * len(chunks))
+
+    if not chunks:
+        raise ValueError("❌ PDF text extraction returned no content.")
+
+    vector_db.add_texts(
+        texts=chunks,
+        metadatas=[{"patient": patient}] * len(chunks)
+    )
     vector_db.persist()
 
+
 def answer_report(q, patient):
-    docs = vector_db.similarity_search(q, k=3, filter={"patient": patient})
+    docs = vector_db.similarity_search(
+        q,
+        k=3,
+        filter={"patient": patient}
+    )
+
     if not docs:
-        return "No report data found."
+        return "No report data found for this patient."
 
     context = "\n\n".join([d.page_content for d in docs])
-    prompt = f"Context:\n{context}\n\nQuestion: {q}\nAnswer clinically:"
-    return call_llm([{"role": "user", "content": prompt}])
 
+    prompt = f"""
+    You are a medical summarization expert.
+
+    Use ONLY the context from patient reports below.  
+    If the answer is not in the report, say: 
+    "This information is not available in the uploaded report."
+
+    Context:
+    {context}
+
+    Question: {q}
+
+    Provide a clear clinical answer:
+    """
+
+    return call_llm([{"role": "user", "content": prompt}])
 
 # -------------------------------------------------------
 # SMART CHART ENGINE
