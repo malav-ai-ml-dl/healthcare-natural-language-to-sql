@@ -1,13 +1,28 @@
+# Core & UI
 streamlit>=1.38.0,<1.43.0
+
+# Data & viz
 pandas>=2.2.0,<2.3.0
 plotly>=5.22.0,<5.26.0
+
+# PDF
 pdfplumber>=0.11.0,<0.12.0
+
+# SQL
 sqlalchemy>=2.0.0,<2.1.0
+
+# Azure OpenAI + embeddings
 openai>=1.40.0,<1.56.0
 tiktoken>=0.7.0,<0.9.0
+
+# Vector store (local, cpu-only)
 faiss-cpu>=1.8.0
+
+# Shared dependencies
 numpy>=1.26.0,<2.0.0
 requests>=2.32.0,<2.33.0
-langchain-core>=0.2.38,<0.3.0
-langchain-text-splitters>=0.2.4,<0.3.0
-langchain-openai>=0.2.0,<0.3.0     # ← this is the critical fix
+
+# LangChain pieces – aligned to 0.3.x series
+langchain-core>=0.3.0,<0.4.0
+langchain-text-splitters>=0.3.0,<0.4.0
+langchain-openai>=0.2.0,<0.3.0
