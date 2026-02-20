@@ -106,7 +106,8 @@ def init_vector_db():
         model="text-embedding-3-small",
         azure_endpoint="https://makeathonmj-ai.openai.azure.com",
         api_key=API_KEY,
-        azure_deployment="text-embedding-3-small"
+        azure_deployment="text-embedding-3-small",
+        api_version="2025-01-01-preview"
     )
 
     return Chroma(
@@ -114,7 +115,6 @@ def init_vector_db():
         embedding_function=embeddings,
         persist_directory="chroma_reports"
     )
-
 
 vector_db = init_vector_db()
 
