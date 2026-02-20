@@ -3,11 +3,12 @@ pandas
 sqlalchemy
 requests
 pdfplumber
-langchain
-langchain-openai
-langchain-community
+langchain==0.1.16
+langchain-openai==0.1.6
+langchain-community==0.0.34
 chromadb==0.4.22
 pydantic==1.10.13
+typing_extensions==4.7.1
 pysqlite3-binary
 plotly
 python-dotenv
