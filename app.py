@@ -1,6 +1,5 @@
 import streamlit as st
 import pandas as pd
-import sqlite3
 import json
 import requests
 import pdfplumber
@@ -9,6 +8,7 @@ from sqlalchemy import create_engine, text
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_community.vectorstores import Chroma
 from langchain_openai import AzureOpenAIEmbeddings
+import plotly.express as px
 
 # -------------------------------------------------------
 # GLOBAL CONFIG
@@ -22,8 +22,6 @@ API_ENDPOINT = (
 )
 API_KEY = st.secrets["AZURE_OPENAI_API_KEY"]
 
-db_path = Path(__file__).parent / "demo_healthcare.db"
-engine = create_engine(f"sqlite:///{db_path}")
 
 # -------------------------------------------------------
 # LLM CALL
@@ -31,10 +29,13 @@ engine = create_engine(f"sqlite:///{db_path}")
 def call_llm(messages):
     headers = {"Content-Type": "application/json", "api-key": API_KEY}
     payload = {"messages": messages, "temperature": 0, "max_tokens": 1500}
+
     res = requests.post(API_ENDPOINT, headers=headers, data=json.dumps(payload))
     if res.status_code != 200:
         raise Exception(res.text)
+
     return res.json()["choices"][0]["message"]["content"]
+
 
 # -------------------------------------------------------
 # SQL PROMPT
@@ -44,11 +45,9 @@ You are an expert SQL generator for a SQLite healthcare database.
 
 STRICT RULES:
 - Output ONLY valid SQL.
-- No explanations.
-- No markdown, no backticks.
-- Never invent tables or columns.
-- 'M' = Male, 'F' = Female.
-- Use COUNT(*) AS alias for counts.
+- Do NOT explain.
+- No markdown or backticks.
+- Do NOT invent tables or columns.
 
 SCHEMA:
 patients(id, name, age, gender)
@@ -62,12 +61,12 @@ SQL:
 """
 
 def generate_sql(question):
-    prompt = SQL_PROMPT.format(question=question)
-    sql = call_llm([{"role": "user", "content": prompt}])
-    return sql.replace("```","").strip()
+    raw = call_llm([{"role": "user", "content": SQL_PROMPT.format(question=question)}])
+    return raw.replace("```", "").strip()
+
 
 # -------------------------------------------------------
-# RAG SETUP
+# RAG VECTOR DB
 # -------------------------------------------------------
 @st.cache_resource
 def get_vector_db():
@@ -76,11 +75,7 @@ def get_vector_db():
         api_key=API_KEY,
         azure_deployment="text-embedding-3-small"
     )
-    return Chroma(
-        collection_name="reports",
-        embedding_function=embeddings,
-        persist_directory="chroma_reports"
-    )
+    return Chroma(collection_name="reports", embedding_function=embeddings, persist_directory="chroma_reports")
 
 vector_db = get_vector_db()
 
@@ -94,45 +89,132 @@ def embed_report(text, patient):
     vector_db.add_texts(chunks, metadatas=[{"patient": patient}] * len(chunks))
     vector_db.persist()
 
-def answer_report(question, patient):
-    docs = vector_db.similarity_search(question, k=3, filter={"patient": patient})
+def answer_report(q, patient):
+    docs = vector_db.similarity_search(q, k=3, filter={"patient": patient})
     if not docs:
         return "No report data found."
 
     context = "\n\n".join([d.page_content for d in docs])
-    prompt = f"Context:\n{context}\n\nQuestion: {question}\nAnswer clinically:"
-    return call_llm([{"role":"user","content": prompt}])
+    prompt = f"Context:\n{context}\n\nQuestion: {q}\nAnswer clinically:"
+    return call_llm([{"role": "user", "content": prompt}])
+
 
 # -------------------------------------------------------
-# SIDEBAR NAV
+# SMART CHART ENGINE
+# -------------------------------------------------------
+def auto_chart(df):
+    numeric = df.select_dtypes(include="number").columns.tolist()
+    text = df.select_dtypes(include="object").columns.tolist()
+    cols = df.columns
+
+    # 1) Single metric
+    if df.shape == (1,1):
+        st.metric(df.columns[0], df.iloc[0,0])
+        return
+
+    chart_type = st.selectbox(
+        "Select chart type:",
+        ["Auto", "Bar Chart", "Line Chart", "Pie Chart", "Scatter"],
+        key=str(cols)
+    )
+
+    def title(x, y=None):
+        return f"{y} by {x}" if y else x
+
+    if chart_type == "Auto":
+        # A) date → line
+        date_cols = [c for c in cols if "date" in c.lower()]
+        if date_cols and numeric:
+            fig = px.line(df, x=date_cols[0], y=numeric)
+            st.plotly_chart(fig, use_container_width=True)
+            return
+
+        # B) category + numeric → bar
+        if len(text) == 1 and len(numeric) == 1:
+            fig = px.bar(df, x=text[0], y=numeric[0])
+            st.plotly_chart(fig, use_container_width=True)
+            return
+
+        # C) numeric discrete (like age) → bar
+        if len(numeric) == 2 and df[numeric[0]].nunique() <= 50:
+            fig = px.bar(df, x=numeric[0], y=numeric[1])
+            st.plotly_chart(fig, use_container_width=True)
+            return
+
+        # D) multi numeric → line
+        if len(numeric) >= 2:
+            fig = px.line(df[numeric])
+            st.plotly_chart(fig, use_container_width=True)
+            return
+
+        st.info("No suitable visualization.")
+        return
+
+    # MANUAL MODES
+    if chart_type == "Bar Chart" and len(numeric) >= 1:
+        fig = px.bar(df, x=cols[0], y=numeric[-1])
+        st.plotly_chart(fig, use_container_width=True)
+        return
+
+    if chart_type == "Line Chart" and len(numeric) >= 1:
+        fig = px.line(df, x=cols[0], y=numeric)
+        st.plotly_chart(fig, use_container_width=True)
+        return
+
+    if chart_type == "Pie Chart" and len(text) >= 1 and len(numeric) >= 1:
+        fig = px.pie(df, names=text[0], values=numeric[-1])
+        st.plotly_chart(fig, use_container_width=True)
+        return
+
+    if chart_type == "Scatter" and len(numeric) >= 2:
+        fig = px.scatter(df, x=numeric[0], y=numeric[1])
+        st.plotly_chart(fig, use_container_width=True)
+        return
+
+
+# -------------------------------------------------------
+# DATABASE SETUP (SQLite only)
+# -------------------------------------------------------
+if "engine" not in st.session_state:
+    st.session_state.engine = None
+
+st.sidebar.title("🗄 Database Setup")
+
+db_name = st.sidebar.text_input("Enter SQLite DB name:", "demo_healthcare.db")
+
+if st.sidebar.button("Connect Database"):
+    try:
+        engine = create_engine(f"sqlite:///{db_name}")
+        # test query
+        pd.read_sql("SELECT name FROM sqlite_master", engine)
+        st.session_state.engine = engine
+        st.sidebar.success(f"Connected to {db_name}")
+    except Exception as e:
+        st.sidebar.error(str(e))
+
+engine = st.session_state.engine
+
+
+# -------------------------------------------------------
+# SIDEBAR NAVIGATION
 # -------------------------------------------------------
 st.sidebar.title("📌 Navigation")
-page = st.sidebar.radio(
-    "Go to:",
-    ["🏠 Home", "🧠 SQL Assistant", "📄 Patient RAG", "⚙️ Database Viewer"]
-)
+page = st.sidebar.radio("Go to:", ["🏠 Home", "🧠 SQL Assistant", "📄 Patient RAG", "📘 Database Viewer"])
+
 
 # -------------------------------------------------------
 # HOME PAGE
 # -------------------------------------------------------
 if page == "🏠 Home":
     st.markdown("""
-    <div style="background:#1F2937;padding:35px;border-radius:15px;text-align:center">
-        <h1 style="color:white;">🏥 Healthcare AI Assistant</h1>
-        <p style="color:#d1d5db;font-size:18px;">
-            Your all-in-one platform for Healthcare Data Intelligence 🚀  
-        </p>
-    </div>
+    <h1 style='text-align:center'>🏥 Healthcare AI Assistant</h1>
+    <p style='text-align:center;font-size:18px'>
+        Natural Language SQL + Clinical RAG + Database Viewer  
+    </p>
     """, unsafe_allow_html=True)
 
-    st.write("### Welcome!")
-    st.write("Use the sidebar to navigate between modules:")
+    st.info("👉 Set up your database in the sidebar first!")
 
-    st.info("""
-    **🧠 SQL Assistant** → Ask natural questions about your database  
-    **📄 Patient RAG** → Upload PDFs & ask patient-specific clinical questions  
-    **⚙️ DB Viewer** → View your SQLite tables  
-    """)
 
 # -------------------------------------------------------
 # SQL ASSISTANT
@@ -140,205 +222,41 @@ if page == "🏠 Home":
 elif page == "🧠 SQL Assistant":
     st.title("🧠 Natural Language → SQL Assistant")
 
+    if engine is None:
+        st.warning("⚠ Connect a SQLite DB first from the sidebar.")
+        st.stop()
+
     if "history" not in st.session_state:
         st.session_state.history = []
 
-    # ---------------------------
-    # EXAMPLE QUESTIONS
-    # ---------------------------
-    st.write("### 🔍 Try an Example Question")
-
+    st.write("### 🔍 Example Questions")
     examples = [
         "How many patients are there?",
         "Show all male patients.",
         "How many male and female patients?",
         "Which patient has the most medications?",
-        "List all visits by date.",
         "Show patient count grouped by age.",
-        "What is the average age of patients?"
+        "List all visits by date."
     ]
 
     cols = st.columns(3)
     for i, q in enumerate(examples):
         with cols[i % 3]:
             if st.button(q):
-                try:
-                    sql = generate_sql(q)
-                    with engine.connect() as conn:
-                        df = pd.read_sql(text(sql), conn)
-
-                    st.session_state.history.append({"q": q, "sql": sql, "df": df})
-                    st.rerun()
-                except Exception as e:
-                    st.error(str(e))
+                sql = generate_sql(q)
+                df = pd.read_sql(text(sql), engine)
+                st.session_state.history.append({"q": q, "sql": sql, "df": df})
+                st.rerun()
 
     st.markdown("---")
 
-    # ---------------------------
-    # USER QUESTION
-    # ---------------------------
-    question = st.chat_input("Ask a question about your healthcare data...")
+    q = st.chat_input("Ask something about your data...")
+    if q:
+        sql = generate_sql(q)
+        df = pd.read_sql(text(sql), engine)
+        st.session_state.history.append({"q": q, "sql": sql, "df": df})
+        st.rerun()
 
-    if question:
-        try:
-            sql = generate_sql(question)
-            with engine.connect() as conn:
-                df = pd.read_sql(text(sql), conn)
-
-            st.session_state.history.append({"q": question, "sql": sql, "df": df})
-            st.rerun()
-        except Exception as e:
-            st.error(str(e))
-
-    # --------------------------------------------------------
-    # SMART CHART ENGINE
-    # --------------------------------------------------------
-    import plotly.express as px
-
-def auto_chart(df):
-    numeric_cols = df.select_dtypes(include=["number"]).columns.tolist()
-    text_cols = df.select_dtypes(include=["object"]).columns.tolist()
-    cols = df.columns
-
-    # Title helpers
-    def title_from_cols(x, y=None):
-        if y:
-            return f"{y.replace('_',' ').title()} by {x.replace('_',' ').title()}"
-        return x.replace('_',' ').title()
-
-    # 1) Single metric → show metric
-    if df.shape == (1, 1):
-        st.metric(df.columns[0], df.iloc[0, 0])
-        return
-
-    # 2) User chart override selector
-    chart_choice = st.selectbox(
-        "Choose visualization:",
-        ["Auto", "Bar Chart", "Line Chart", "Pie Chart", "Scatter"],
-        key=str(cols)
-    )
-
-    # --- AUTO MODE ---
-    if chart_choice == "Auto":
-
-        # A) Date column → Line chart
-        date_cols = [c for c in cols if "date" in c.lower()]
-        if date_cols and len(numeric_cols) >= 1:
-            fig = px.line(
-                df, x=date_cols[0], y=numeric_cols,
-                title=title_from_cols(date_cols[0])
-            )
-            st.plotly_chart(fig, use_container_width=True)
-            return
-
-        # B) Text category + numeric → Bar chart
-        if len(text_cols) == 1 and len(numeric_cols) == 1:
-            x, y = text_cols[0], numeric_cols[0]
-            fig = px.bar(df, x=x, y=y, title=title_from_cols(x, y))
-            st.plotly_chart(fig, use_container_width=True)
-            return
-
-        # C) Numeric discrete categories → Bar chart
-        if len(numeric_cols) == 2:
-            x, y = numeric_cols[0], numeric_cols[1]
-            if df[x].nunique() <= 50:   # the age fix
-                fig = px.bar(df, x=x, y=y, title=title_from_cols(x, y))
-                st.plotly_chart(fig, use_container_width=True)
-                return
-
-        # D) Multiple numeric → Line chart
-        if len(numeric_cols) >= 2:
-            fig = px.line(df, y=numeric_cols, title="Numeric Trends")
-            st.plotly_chart(fig, use_container_width=True)
-            return
-
-        # E) Percentages → Pie
-        if any("%" in c.lower() for c in cols):
-            x, y = text_cols[0], numeric_cols[0]
-            fig = px.pie(df, values=y, names=x, title=title_from_cols(x, y))
-            st.plotly_chart(fig, use_container_width=True)
-            return
-
-        st.info("No suitable chart found.")
-        return
-
-    # --- USER OVERRIDE MODES (if they choose manually) ---
-    if chart_choice == "Bar Chart":
-        if len(numeric_cols) >= 1:
-            fig = px.bar(df, x=cols[0], y=numeric_cols[-1], title=title_from_cols(cols[0], numeric_cols[-1]))
-            st.plotly_chart(fig, use_container_width=True)
-        else:
-            st.warning("Not enough numeric data for Bar Chart.")
-        return
-
-    if chart_choice == "Line Chart":
-        if len(numeric_cols) >= 1:
-            fig = px.line(df, x=cols[0], y=numeric_cols, title=title_from_cols(cols[0]))
-            st.plotly_chart(fig, use_container_width=True)
-        else:
-            st.warning("Not enough numeric data for Line Chart.")
-        return
-
-    if chart_choice == "Pie Chart":
-        if len(text_cols) >= 1 and len(numeric_cols) >= 1:
-            fig = px.pie(df, names=text_cols[0], values=numeric_cols[-1], title=title_from_cols(text_cols[0], numeric_cols[-1]))
-            st.plotly_chart(fig, use_container_width=True)
-        else:
-            st.warning("Need 1 category & 1 numeric column.")
-        return
-
-    if chart_choice == "Scatter":
-        if len(numeric_cols) >= 2:
-            fig = px.scatter(df, x=numeric_cols[0], y=numeric_cols[1], title=title_from_cols(numeric_cols[0], numeric_cols[1]))
-            st.plotly_chart(fig, use_container_width=True)
-        else:
-            st.warning("Need two numeric columns.")
-        return
-    def auto_chart(df):
-        import pandas as pd
-        import streamlit as st
-
-        # 1) Single metric
-        if df.shape == (1, 1):
-            st.metric("Result", df.iloc[0, 0])
-            return
-
-        cols = df.columns
-
-        # Identify types
-        numeric_cols = df.select_dtypes(include='number').columns.tolist()
-        text_cols = df.select_dtypes(include='object').columns.tolist()
-        date_cols = [c for c in cols if "date" in c.lower()]
-
-        # 2) Line chart if a date column exists
-        if date_cols and len(numeric_cols) >= 1:
-            st.line_chart(df, x=date_cols[0], y=numeric_cols)
-            return
-        
-        # 3) Category + numeric → bar chart
-        if len(text_cols) == 1 and len(numeric_cols) == 1:
-            st.bar_chart(df, x=text_cols[0], y=numeric_cols[0])
-            return
-
-        # 4) Multiple numeric columns → line chart
-        if len(numeric_cols) >= 2:
-            st.line_chart(df[numeric_cols])
-            return
-
-        # 5) Percentage columns → pie chart
-        if any("%" in c.lower() or "rate" in c.lower() for c in cols):
-            import plotly.express as px
-            cname = numeric_cols[0]
-            fig = px.pie(df, values=cname, names=text_cols[0])
-            st.plotly_chart(fig)
-            return
-
-        # 6) Fallback
-        st.info("No suitable visualization for this query.")
-
-    # --------------------------------------------------------
-    # DISPLAY HISTORY
-    # --------------------------------------------------------
     for item in st.session_state.history:
         with st.container(border=True):
             st.subheader(f"❓ {item['q']}")
@@ -355,6 +273,7 @@ def auto_chart(df):
             with sqltab:
                 st.code(item["sql"], language="sql")
 
+
 # -------------------------------------------------------
 # PATIENT RAG
 # -------------------------------------------------------
@@ -363,34 +282,40 @@ elif page == "📄 Patient RAG":
 
     col1, col2 = st.columns(2)
     with col1:
-        pdf = st.file_uploader("Upload PDF report", type=["pdf"])
+        pdf = st.file_uploader("Upload patient PDF", type=["pdf"])
     with col2:
         patient = st.text_input("Patient Name")
 
     if pdf and patient:
         text = extract_pdf(pdf)
         embed_report(text, patient)
-        st.success("Report embedded successfully!")
+        st.success("Report embedded!")
 
-    q = st.text_input("Ask something about this patient’s report")
-
+    q = st.text_input("Ask a question about this patient report:")
     if q and patient:
         with st.spinner("Analyzing..."):
             ans = answer_report(q, patient)
         st.write("### 🧠 Clinical Insight")
         st.write(ans)
 
+
 # -------------------------------------------------------
 # DATABASE VIEWER
 # -------------------------------------------------------
-elif page == "⚙️ Database Viewer":
-    st.title("⚙️ Database Viewer")
+elif page == "📘 Database Viewer":
+    st.title("📘 Database Viewer")
 
-    tables = ["patients", "visits", "medications"]
+    if engine is None:
+        st.warning("⚠ Connect a SQLite DB first from the sidebar.")
+        st.stop()
+
+    tables = pd.read_sql("SELECT name FROM sqlite_master WHERE type='table'", engine)["name"].tolist()
+
+    if not tables:
+        st.info("No tables found in this database.")
+        st.stop()
 
     for t in tables:
         st.subheader(f"📌 {t}")
         df = pd.read_sql(f"SELECT * FROM {t}", engine)
         st.dataframe(df, use_container_width=True)
-
-
