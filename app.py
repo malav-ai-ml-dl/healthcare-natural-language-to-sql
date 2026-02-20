@@ -113,22 +113,22 @@ def generate_sql(question):
 # RAG VECTOR DB
 # -------------------------------------------------------
 @st.cache_resource
-def get_vector_db():
+def init_vector_db():
     embeddings = AzureOpenAIEmbeddings(
         model="text-embedding-3-small",
         azure_endpoint="https://makeathonmj-ai.openai.azure.com",
         api_key=API_KEY,
-        azure_deployment="text-embedding-3-small"
+        azure_deployment="text-embedding-3-small",
     )
+
+    # Streamlit Cloud safe directory
+    persist_dir = "./.streamlit/chroma_reports"
 
     return Chroma(
         collection_name="reports",
         embedding_function=embeddings,
-        persist_directory="chroma_reports"
+        persist_directory=persist_dir,
     )
-
-# Initialize vector DB globally
-vector_db = get_vector_db()
 
 
 def extract_pdf(pdf):
@@ -137,18 +137,17 @@ def extract_pdf(pdf):
 
 
 def embed_report(text, patient):
-    splitter = RecursiveCharacterTextSplitter(chunk_size=700, chunk_overlap=100)
-    chunks = splitter.split_text(text)
+    splitter = RecursiveCharacterTextSplitter(chunk_size=800, chunk_overlap=100)
+    chunks = [c for c in splitter.split_text(text) if c.strip()]
 
     if not chunks:
-        raise ValueError("❌ PDF text extraction returned no content.")
+        raise Exception("PDF extraction returned empty text.")
 
     vector_db.add_texts(
         texts=chunks,
         metadatas=[{"patient": patient}] * len(chunks)
     )
     vector_db.persist()
-
 
 def answer_report(q, patient):
     docs = vector_db.similarity_search(
