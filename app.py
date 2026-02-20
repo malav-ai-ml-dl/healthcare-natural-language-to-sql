@@ -393,4 +393,4 @@ elif page == "⚙️ Database Viewer":
         df = pd.read_sql(f"SELECT * FROM {t}", engine)
         st.dataframe(df, use_container_width=True)
 
-can you gve complete ready code
+
