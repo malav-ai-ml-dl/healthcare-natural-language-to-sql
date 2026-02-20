@@ -6,25 +6,25 @@ pdfplumber==0.11.0
 plotly==5.20.0
 
 # ---------------------------
-# LANGCHAIN + AZURE + CHROMA
+# LANGCHAIN + AZURE + CHROMA (compatible set)
 # ---------------------------
 langchain==0.1.16
-langchain-community==0.0.37
-langchain-openai==0.1.1
+langchain-community==0.0.34
+langchain-openai==0.1.6
 langchain-text-splitters==0.0.2
 
 chromadb==0.4.24
 
 # ---------------------------
-# CRITICAL: OpenAI 1.x REQUIRED
+# OpenAI SDK (Azure compatible)
 # ---------------------------
-# (for AzureOpenAIEmbeddings to work)
-openai==1.12.0
+openai==1.14.2
 
 # ---------------------------
-# Pydantic v1 for LangChain compatibility
+# Pydantic v1 for stability
 # ---------------------------
-pydantic==1.10.13
+pydantic==1.10.14
+pydantic_core==2.14.6
 
 tiktoken==0.5.2
 pysqlite3-binary
