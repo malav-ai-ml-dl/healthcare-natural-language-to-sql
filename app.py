@@ -10,15 +10,19 @@ from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_openai import AzureOpenAIEmbeddings
 import faiss
 import numpy as np
-import pickle
 
 import plotly.express as px
 
 
 # ───────────────────────────────────────────────
-# CONFIG
+# PAGE CONFIG & SECRETS
 # ───────────────────────────────────────────────
-st.set_page_config(page_title="Healthcare AI Assistant", page_icon="🏥", layout="wide")
+st.set_page_config(
+    page_title="MedAI Assistant – Clinical & Data Intelligence",
+    page_icon="🏥",
+    layout="wide",
+    initial_sidebar_state="expanded"
+)
 
 API_KEY = st.secrets["AZURE_OPENAI_API_KEY"]
 LLM_ENDPOINT = (
@@ -27,84 +31,71 @@ LLM_ENDPOINT = (
     "?api-version=2025-01-01-preview"
 )
 
-INDEX_FILE = Path("faiss_index.bin")
-METADATA_FILE = Path("metadata.pkl")
-
 
 # ───────────────────────────────────────────────
 # LLM CALL
 # ───────────────────────────────────────────────
-def call_llm(messages):
+def call_llm(messages, temperature=0.1, max_tokens=1800):
     headers = {"Content-Type": "application/json", "api-key": API_KEY}
-    payload = {"messages": messages, "temperature": 0, "max_tokens": 1200}
-    r = requests.post(LLM_ENDPOINT, headers=headers, json=payload)
-    if r.status_code != 200:
-        raise Exception(r.text)
-    return r.json()["choices"][0]["message"]["content"]
+    payload = {
+        "messages": messages,
+        "temperature": temperature,
+        "max_tokens": max_tokens
+    }
+    try:
+        r = requests.post(LLM_ENDPOINT, headers=headers, json=payload, timeout=90)
+        r.raise_for_status()
+        return r.json()["choices"][0]["message"]["content"]
+    except Exception as e:
+        st.error(f"LLM API error: {str(e)}")
+        return None
 
 
 # ───────────────────────────────────────────────
-# STRICT SQL PROMPT
+# SQL GENERATION
 # ───────────────────────────────────────────────
-SQL_PROMPT = """
-You are a SQL generator for a STRICT SQLite healthcare database.
+SQL_PROMPT = """You are a precise SQLite SQL generator for a healthcare database.
+Return **ONLY** valid SQL – no explanations, no markdown, no comments.
 
-RULES:
-- Return ONLY executable SQL (no explanation, no markdown).
-- Do NOT hallucinate tables or columns.
-- Gender values are ONLY 'M' or 'F'.
-- Use COUNT(*) AS count for counting.
-- Use GROUP BY when grouping.
-- Use SELECT * for listing rows.
-- Use correct table and column names exactly as below.
+Rules:
+- Use exactly the schema below – do NOT invent tables/columns
+- Gender: only 'M' or 'F'
+- Use COUNT(*) AS count
+- GROUP BY for aggregations
+- SELECT * when showing rows
+- Safe SQL only – no DDL/DML except SELECT
 
 SCHEMA:
 patients(id, name, age, gender)
 visits(id, patient_id, visit_date, reason)
 medications(id, patient_id, medication)
 
-GOOD EXAMPLES:
-Q: How many patients?
-A:
+Examples:
+Q: How many patients? →
 SELECT COUNT(*) AS count FROM patients;
 
-Q: Show all male patients.
-A:
-SELECT * FROM patients WHERE gender='M';
+Q: Male patients → 
+SELECT * FROM patients WHERE gender = 'M';
 
-Q: How many male and female patients?
-A:
-SELECT gender, COUNT(*) AS count FROM patients GROUP BY gender;
-
-Q: Which patient has the most medications?
-A:
-SELECT p.name, COUNT(m.medication) AS count
-FROM patients p
-JOIN medications m ON p.id = m.patient_id
-GROUP BY p.name
-ORDER BY count DESC;
-
-NOW WRITE THE SQL ONLY for this question:
+NOW – generate SQL ONLY for:
 {question}
-
-SQL:
 """
 
 
 def generate_sql(question):
     prompt = SQL_PROMPT.format(question=question)
-    sql = call_llm([{"role": "user", "content": prompt}]).strip()
-    sql = sql.replace("```", "").replace("`", "").strip()
-
-    forbidden = ["DROP", "DELETE", "UPDATE", "INSERT", "ALTER"]
-    if any(f in sql.upper() for f in forbidden):
-        raise Exception("Unsafe SQL detected.")
-
+    response = call_llm([{"role": "user", "content": prompt}], temperature=0.0)
+    if not response:
+        return None
+    sql = response.strip().replace("```sql", "").replace("```", "").strip()
+    forbidden = ["DROP", "DELETE", "UPDATE", "INSERT", "ALTER", "CREATE", "TRUNCATE"]
+    if any(word in sql.upper() for word in forbidden):
+        raise ValueError("Unsafe SQL pattern detected")
     return sql
 
 
 # ───────────────────────────────────────────────
-# IMPROVED IN-MEMORY RAG (session state – no disk)
+# EMBEDDINGS & IN-MEMORY RAG
 # ───────────────────────────────────────────────
 embeddings = AzureOpenAIEmbeddings(
     model="text-embedding-3-small",
@@ -113,57 +104,63 @@ embeddings = AzureOpenAIEmbeddings(
     azure_deployment="text-embedding-3-small"
 )
 
-# Use one global store per session (clears on tab close / refresh)
-if "patient_indices" not in st.session_state:
-    st.session_state.patient_indices = {}   # patient_name → {"index": faiss.Index, "metadata": list}
+if "patient_docs" not in st.session_state:
+    st.session_state.patient_docs = {}  # patient → {"index", "metadata", "filename", "loaded_at"}
 
 
-def embed_report(text: str, patient: str):
+def process_and_index_report(pdf_file, patient_name: str):
+    patient_name = patient_name.strip()
+    if not patient_name:
+        return False, "Please enter patient name"
+
+    try:
+        text = ""
+        with pdfplumber.open(pdf_file) as pdf:
+            for page in pdf.pages:
+                txt = page.extract_text()
+                if txt:
+                    text += txt + "\n\n"
+
+        if not text.strip():
+            return False, "No readable text found in PDF"
+
+        splitter = RecursiveCharacterTextSplitter(
+            chunk_size=750,
+            chunk_overlap=140,
+            separators=["\n\n", "\n", ". ", "!", "?", " ", ""]
+        )
+        chunks = splitter.split_text(text.strip())
+
+        if not chunks:
+            return False, "Could not split document into chunks"
+
+        emb_list = embeddings.embed_documents(chunks)
+        emb_array = np.array(emb_list).astype("float32")
+
+        index = faiss.IndexFlatL2(emb_array.shape[1])
+        index.add(emb_array)
+
+        metadata = [{"patient": patient_name, "text": c} for c in chunks]
+
+        st.session_state.patient_docs[patient_name] = {
+            "index": index,
+            "metadata": metadata,
+            "filename": pdf_file.name,
+            "loaded_at": pd.Timestamp.now().strftime("%Y-%m-%d %H:%M")
+        }
+
+        return True, f"Report indexed successfully ({len(chunks)} sections)"
+
+    except Exception as e:
+        return False, f"Processing failed: {str(e)}"
+
+
+def query_report(question: str, patient: str):
     patient = patient.strip()
-    if not patient:
-        st.error("Enter patient name.")
-        return
-    if not text.strip():
-        st.error("PDF has no extractable text.")
-        return
+    if not patient or patient not in st.session_state.patient_docs:
+        return None, "No report loaded for this patient"
 
-    splitter = RecursiveCharacterTextSplitter(chunk_size=700, chunk_overlap=120)
-    chunks = splitter.split_text(text)
-    if not chunks:
-        st.warning("No chunks created.")
-        return
-
-    with st.spinner(f"Embedding {len(chunks)} chunks..."):
-        try:
-            emb_list = embeddings.embed_documents(chunks)
-            emb_array = np.array(emb_list).astype("float32")
-        except Exception as e:
-            st.error(f"Embedding failed: {e}")
-            return
-
-    dim = emb_array.shape[1]
-    index = faiss.IndexFlatL2(dim)
-    index.add(emb_array)
-
-    metadata = [{"patient": patient, "text": c} for c in chunks]
-
-    # Store in session
-    st.session_state.patient_indices[patient] = {"index": index, "metadata": metadata}
-
-    st.success(f"Embedded {len(chunks)} chunks for **{patient}**")
-    with st.expander("Preview first chunk"):
-        st.write(chunks[0][:600] + "..." if chunks else "No content")
-
-
-def ask_report(question: str, patient: str):
-    patient = patient.strip()
-    if not patient:
-        return "Enter patient name."
-
-    if patient not in st.session_state.patient_indices:
-        return f"No report embedded yet for '{patient}'.\n\nUpload PDF → Embed first."
-
-    data = st.session_state.patient_indices[patient]
+    data = st.session_state.patient_docs[patient]
     index = data["index"]
     metadata = data["metadata"]
 
@@ -171,226 +168,284 @@ def ask_report(question: str, patient: str):
         q_emb = embeddings.embed_query(question)
         q_array = np.array([q_emb]).astype("float32")
 
-        distances, indices = index.search(q_array, k=6)
+        D, I = index.search(q_array, k=10)
 
         relevant = []
-        for idx, dist in zip(indices[0], distances[0]):
+        for idx, dist in zip(I[0], D[0]):
             if idx == -1:
                 continue
-            chunk = metadata[idx]["text"]
-            relevant.append(chunk)
+            relevant.append(metadata[idx]["text"])
 
         if not relevant:
-            return "No relevant content found in the report."
+            return None, "No relevant information found in report"
 
-        context = "\n\n---\n\n".join(relevant[:4])
+        context = "\n\n─────────────────────────────\n\n".join(relevant[:6])
 
-        prompt = f"""Clinical context only from this patient's report:
+        prompt = f"""You are an experienced clinical decision support assistant.
+
+Rules:
+- Answer using **only** the provided report excerpts.
+- Use precise medical language.
+- Structure answer professionally:
+  ### Clinical Summary
+  ### Key Findings
+  ### Interpretation & Implications
+  ### Missing / Unclear Information (if relevant)
+- Be cautious — do not invent facts.
+- If question is unrelated to report, say so politely.
+
+Report content:
 {context}
 
-Question: {question}
+Question:
+{question}
 
-Answer concisely using only the context:"""
+Answer:"""
 
-        return call_llm([{"role": "user", "content": prompt}])
+        answer = call_llm([{"role": "user", "content": prompt}], temperature=0.15)
+        return answer, None
 
     except Exception as e:
-        return f"Search error: {e}"
+        return None, f"Query error: {str(e)}"
+
+
 # ───────────────────────────────────────────────
-# AUTO CHART
+# AUTO VISUALIZATION
 # ───────────────────────────────────────────────
-def auto_chart(df):
+def render_auto_chart(df: pd.DataFrame):
     if df.empty:
-        st.info("No data to chart.")
+        st.info("No data available for visualization.")
         return
 
-    if df.shape == (1, 1):
+    if len(df) == 1 and len(df.columns) == 1:
         st.metric(df.columns[0], df.iloc[0, 0])
         return
 
-    numeric = df.select_dtypes(include="number").columns.tolist()
-    text_cols = df.select_dtypes(include="object").columns.tolist()
-    cols = df.columns
+    numeric_cols = df.select_dtypes(include="number").columns.tolist()
+    cat_cols = df.select_dtypes(include=["object", "category"]).columns.tolist()
 
     chart_type = st.selectbox(
-        "Chart Type:", ["Auto", "Bar", "Line", "Pie", "Scatter"], key="chart_" + "_".join(cols)
+        "Visualization type",
+        ["Auto", "Bar", "Line", "Pie", "Scatter"],
+        key=f"chart_{hash(df.to_string())}"
     )
 
     if chart_type == "Auto":
-        date_cols = [c for c in cols if "date" in c.lower()]
-        if date_cols and numeric:
-            st.plotly_chart(px.line(df, x=date_cols[0], y=numeric), use_container_width=True)
+        date_like = [c for c in df.columns if "date" in c.lower() or "time" in c.lower()]
+        if date_like and numeric_cols:
+            st.plotly_chart(
+                px.line(df, x=date_like[0], y=numeric_cols, height=420),
+                use_container_width=True
+            )
             return
-        if len(text_cols) == 1 and len(numeric) == 1:
-            st.plotly_chart(px.bar(df, x=text_cols[0], y=numeric[0]), use_container_width=True)
+        if len(cat_cols) == 1 and len(numeric_cols) == 1:
+            st.plotly_chart(
+                px.bar(df, x=cat_cols[0], y=numeric_cols[0], height=420),
+                use_container_width=True
+            )
             return
-        if len(numeric) >= 2:
-            st.plotly_chart(px.line(df[numeric]), use_container_width=True)
+        if len(numeric_cols) >= 2:
+            st.plotly_chart(px.line(df[numeric_cols]), use_container_width=True)
             return
-        st.info("No suitable automatic chart found.")
-        return
 
-    if chart_type == "Bar" and len(cols) >= 2:
-        st.plotly_chart(px.bar(df, x=cols[0], y=cols[-1]), use_container_width=True)
-    elif chart_type == "Line" and len(cols) >= 2:
-        st.plotly_chart(px.line(df, x=cols[0], y=cols[-1]), use_container_width=True)
-    elif chart_type == "Pie" and len(text_cols) >= 1 and len(numeric) >= 1:
-        st.plotly_chart(px.pie(df, names=text_cols[0], values=numeric[0]), use_container_width=True)
-    elif chart_type == "Scatter" and len(numeric) >= 2:
-        st.plotly_chart(px.scatter(df, x=numeric[0], y=numeric[1]), use_container_width=True)
+    if chart_type == "Bar" and len(df.columns) >= 2:
+        st.plotly_chart(px.bar(df, x=df.columns[0], y=df.columns[-1]), use_container_width=True)
+    elif chart_type == "Line" and len(df.columns) >= 2:
+        st.plotly_chart(px.line(df, x=df.columns[0], y=df.columns[-1]), use_container_width=True)
+    elif chart_type == "Pie" and len(cat_cols) >= 1 and len(numeric_cols) >= 1:
+        st.plotly_chart(px.pie(df, names=cat_cols[0], values=numeric_cols[0]), use_container_width=True)
+    elif chart_type == "Scatter" and len(numeric_cols) >= 2:
+        st.plotly_chart(px.scatter(df, x=numeric_cols[0], y=numeric_cols[1]), use_container_width=True)
 
 
 # ───────────────────────────────────────────────
-# SIDEBAR DB CONNECTION
+# SIDEBAR – DATABASE CONNECTION
 # ───────────────────────────────────────────────
-st.sidebar.header("🗄 Database Setup")
+with st.sidebar:
+    st.header("🗄 Database Connection")
+    db_name = st.text_input("SQLite filename", value="demo_healthcare.db", help="e.g. healthcare.db")
 
-if "engine" not in st.session_state:
-    st.session_state.engine = None
+    if st.button("Connect to Database", type="primary"):
+        try:
+            engine = create_engine(f"sqlite:///{db_name}")
+            pd.read_sql("SELECT 1", engine)  # quick test
+            st.session_state.engine = engine
+            st.success("Connected!", icon="✅")
+        except Exception as e:
+            st.session_state.engine = None
+            st.error(f"Connection failed: {str(e)}")
 
-db_name = st.sidebar.text_input("SQLite DB Name:", "demo_healthcare.db")
-
-if st.sidebar.button("Connect"):
-    try:
-        engine = create_engine(f"sqlite:///{db_name}")
-        pd.read_sql("SELECT name FROM sqlite_master", engine)  # test connection
-        st.session_state.engine = engine
-        st.sidebar.success("Connected!")
-    except Exception as e:
-        st.sidebar.error(str(e))
-
-engine = st.session_state.engine
-
-
-# ───────────────────────────────────────────────
-# NAVIGATION
-# ───────────────────────────────────────────────
-st.sidebar.header("📌 Navigation")
-page = st.sidebar.radio(
-    "Go to:",
-    ["🏠 Home", "🧠 SQL Assistant", "📄 Patient RAG", "📘 DB Viewer"]
-)
+    st.divider()
+    st.header("Navigation")
+    page = st.radio(
+        "Select module",
+        ["Home", "SQL Assistant", "Patient Reports", "Database Explorer"],
+        format_func=lambda x: f"🏠 {x}" if x == "Home" else f"🧠 {x}" if x == "SQL Assistant" else f"📄 {x}" if x == "Patient Reports" else f"📊 {x}"
+    )
 
 
 # ───────────────────────────────────────────────
 # PAGES
 # ───────────────────────────────────────────────
-if page == "🏠 Home":
-    st.title("🏥 Healthcare AI Assistant")
+engine = st.session_state.get("engine")
+
+if page == "Home":
+    st.title("🏥 MedAI Clinical Assistant")
     st.markdown("""
-    AI-powered features:
-    - Natural language → SQL queries
-    - PDF report intelligence (RAG with FAISS)
-    - Simple database exploration
+    An intelligent healthcare companion that helps you:
+
+    • Ask natural language questions about your patient database  
+    • Get instant SQL-powered insights & visualizations  
+    • Analyze uploaded medical reports with clinical reasoning  
+    • Explore raw database tables safely
+
+    **Select a module from the sidebar to begin.**
     """)
 
+    st.info("Connect your SQLite database in the sidebar to unlock SQL Assistant and Database Explorer.", icon="ℹ️")
 
-elif page == "🧠 SQL Assistant":
+
+elif page == "SQL Assistant":
     st.title("🧠 Natural Language → SQL Insights")
-
-    if engine is None:
-        st.warning("Connect a database first in the sidebar.")
+    if not engine:
+        st.warning("Please connect to a SQLite database first using the sidebar.", icon="⚠️")
         st.stop()
 
+    # Initialize history
     if "sql_history" not in st.session_state:
         st.session_state.sql_history = []
 
-    st.write("### 🔍 Suggested Questions")
-    sample_q = [
-        "Show all male patients.",
-        "How many female patients?",
+    # Suggested questions
+    st.subheader("Quick Start Questions")
+    sample_questions = [
+        "How many patients are there?",
+        "Show all female patients over age 60",
         "Which patient has the most medications?",
-        "List all visits by visit_date.",
-        "Show patient count grouped by age.",
+        "Count visits per reason in the last year",
+        "Average age by gender"
     ]
 
-    cols = st.columns(3)
-    for i, q in enumerate(sample_q):
-        with cols[i % 3]:
-            if st.button(q, key=f"sample_{i}"):
+    cols = st.columns(5)
+    for i, q in enumerate(sample_questions):
+        if cols[i % 5].button(q, key=f"sample_sql_{i}", use_container_width=True):
+            with st.spinner("Generating & executing query..."):
                 try:
                     sql = generate_sql(q)
-                    df = pd.read_sql(text(sql), engine)
-                    st.session_state.sql_history.append({"q": q, "sql": sql, "df": df})
-                    st.rerun()
+                    if sql:
+                        df = pd.read_sql(text(sql), engine)
+                        st.session_state.sql_history.insert(0, {"question": q, "sql": sql, "df": df})
+                        st.rerun()
                 except Exception as e:
-                    st.error(f"Error: {e}")
+                    st.error(f"Error: {str(e)}")
 
-    st.write("---")
+    st.divider()
 
-    user_q = st.chat_input("Ask your own question about the database...")
-    if user_q:
-        try:
-            sql = generate_sql(user_q)
-            df = pd.read_sql(text(sql), engine)
-            st.session_state.sql_history.append({"q": user_q, "sql": sql, "df": df})
+    # User question
+    user_question = st.chat_input("Ask anything about your patient database...")
+
+    if user_question:
+        with st.spinner("Thinking..."):
+            try:
+                sql = generate_sql(user_question)
+                if sql:
+                    df = pd.read_sql(text(sql), engine)
+                    st.session_state.sql_history.insert(0, {"question": user_question, "sql": sql, "df": df})
+                    st.rerun()
+            except Exception as e:
+                st.error(f"Could not process query: {str(e)}")
+
+    # History – newest first
+    if st.session_state.sql_history:
+        st.subheader("Query History")
+
+        if st.button("Clear history", type="secondary"):
+            st.session_state.sql_history = []
             st.rerun()
-        except Exception as e:
-            st.error(f"Error generating/executing SQL: {e}")
 
-    for item in reversed(st.session_state.sql_history):  # newest first
-        with st.container(border=True):
-            st.subheader(f"❓ {item['q']}")
-            df = item["df"]
+        for item in st.session_state.sql_history:
+            with st.expander(f"❓ {item['question']}", expanded=(item == st.session_state.sql_history[0])):
+                tabs = st.tabs(["📊 Result", "📈 Chart", "🧾 SQL"])
 
-            tab1, tab2, tab3 = st.tabs(["📊 Results", "📈 Chart", "🧾 SQL"])
-            with tab1:
-                st.dataframe(df, use_container_width=True)
-            with tab2:
-                auto_chart(df)
-            with tab3:
-                st.code(item["sql"], language="sql")
+                with tabs[0]:
+                    st.dataframe(item["df"], use_container_width=True)
+
+                with tabs[1]:
+                    render_auto_chart(item["df"])
+
+                with tabs[2]:
+                    st.code(item["sql"], language="sql")
 
 
-elif page == "📄 Patient RAG":
-    st.title("📄 Patient Report Intelligence (RAG)")
+elif page == "Patient Reports":
+    st.title("📄 Clinical Report Intelligence")
+    st.caption("Upload PDF reports and ask clinically relevant questions")
 
-    pdf = st.file_uploader("Upload PDF report", type=["pdf"])
-    patient = st.text_input("Patient Name (used as filter)", "")
+    col_left, col_right = st.columns([5, 3])
 
-    if pdf and patient and st.button("Embed this report"):
-        with st.spinner("Extracting & embedding..."):
-            try:
-                text = ""
-                with pdfplumber.open(pdf) as p:
-                    for page in p.pages:
-                        page_text = page.extract_text()
-                        if page_text:
-                            text += page_text + "\n"
-                if text.strip():
-                    embed_report(text, patient.strip())
+    with col_left:
+        pdf = st.file_uploader(
+            "Upload medical report (PDF)",
+            type="pdf",
+            help="Discharge summary, echo, cath report, labs, imaging, etc."
+        )
+
+    with col_right:
+        patient_id = st.text_input(
+            "Patient identifier",
+            placeholder="e.g. Manish Singh, PID-3742, Mr. Patel",
+            help="Used to separate different patients' documents"
+        ).strip()
+
+    if pdf and patient_id:
+        success, msg = process_and_index_report(pdf, patient_id)
+        if success:
+            st.success(msg, icon="✅")
+        else:
+            st.error(msg)
+
+    # Show currently active patient
+    if patient_id and patient_id in st.session_state.patient_docs:
+        info = st.session_state.patient_docs[patient_id]
+        st.caption(f"Active report: **{info['filename']}** • loaded {info['loaded_at']}")
+
+    question = st.chat_input("Ask a clinical question about this report...")
+
+    if question and patient_id:
+        if patient_id not in st.session_state.patient_docs:
+            st.warning("Please upload and process a report for this patient first.")
+        else:
+            with st.chat_message("assistant"):
+                answer, err = query_report(question, patient_id)
+                if err:
+                    st.error(err)
+                elif answer:
+                    st.markdown(answer)
                 else:
-                    st.error("No readable text found in PDF.")
-            except Exception as e:
-                st.error(f"Embedding failed: {e}")
-
-    q = st.text_input("Ask a question about this patient's report:")
-    if q and patient:
-        with st.spinner("Searching reports..."):
-            try:
-                ans = ask_report(q, patient.strip())
-                st.markdown("### 🧠 Clinical Insight")
-                st.write(ans)
-            except Exception as e:
-                st.error(f"Query failed: {e}")
+                    st.info("No answer could be generated from the report.")
 
 
-elif page == "📘 DB Viewer":
-    st.title("📘 Database Viewer")
-
-    if engine is None:
-        st.warning("Connect a database first in the sidebar.")
+elif page == "Database Explorer":
+    st.title("📊 Database Explorer")
+    if not engine:
+        st.warning("Connect to database first via sidebar.")
         st.stop()
 
     try:
-        tables = pd.read_sql(
+        tables_df = pd.read_sql(
             "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'",
             engine
-        )["name"].tolist()
+        )
+        tables = tables_df["name"].tolist()
 
-        for t in tables:
-            st.subheader(f"📌 Table: {t}")
-            df = pd.read_sql(f"SELECT * FROM {t} LIMIT 1000", engine)
-            st.dataframe(df, use_container_width=True)
+        if not tables:
+            st.info("No tables found in database.")
+        else:
+            selected_table = st.selectbox("Select table to view", tables)
+
+            if selected_table:
+                df = pd.read_sql(f"SELECT * FROM {selected_table} LIMIT 1500", engine)
+                st.dataframe(df, use_container_width=True)
+                st.caption(f"{len(df)} rows shown (max 1500)")
+
     except Exception as e:
-        st.error(f"Could not list tables: {e}")
+        st.error(f"Error reading database: {str(e)}")
