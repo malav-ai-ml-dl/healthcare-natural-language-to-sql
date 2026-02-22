@@ -18,7 +18,7 @@ import plotly.express as px
 # PAGE CONFIG & SECRETS
 # ───────────────────────────────────────────────
 st.set_page_config(
-    page_title="MedAI Assistant – Clinical & Data Intelligence",
+    page_title="Clinical Data Assistant – Clinical & Data Intelligence",
     page_icon="🏥",
     layout="wide",
     initial_sidebar_state="expanded"
@@ -290,7 +290,7 @@ with st.sidebar:
 engine = st.session_state.get("engine")
 
 if page == "Home":
-    st.title("🏥 MedAI Clinical Assistant")
+    st.title("🏥 Clinical Data Assistant")
     st.markdown("""
     An intelligent healthcare companion that helps you:
 
