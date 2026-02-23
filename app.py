@@ -258,19 +258,22 @@ def render_auto_chart(df: pd.DataFrame):
         st.plotly_chart(px.scatter(df, x=numeric_cols[0], y=numeric_cols[1]), use_container_width=True)
 
 
-# ───────────────────────────────────────────────
-# SIDEBAR – DATABASE CONNECTION
-# ───────────────────────────────────────────────
 with st.sidebar:
     st.header("🗄 Database Connection")
-    db_name = st.text_input("SQLite filename", value="healthcare.db", help="e.g. healthcare.db")
+
+    # Dropdown for DB selection
+    db_name = st.selectbox(
+        "Choose SQLite Database",
+        ["healthcare.db", "demo_healthcare.db"],
+        index=0
+    )
 
     if st.button("Connect to Database", type="primary"):
         try:
             engine = create_engine(f"sqlite:///{db_name}")
             pd.read_sql("SELECT 1", engine)  # quick test
             st.session_state.engine = engine
-            st.success("Connected!", icon="✅")
+            st.success(f"Connected to {db_name}!", icon="✅")
         except Exception as e:
             st.session_state.engine = None
             st.error(f"Connection failed: {str(e)}")
@@ -280,9 +283,13 @@ with st.sidebar:
     page = st.radio(
         "Select module",
         ["Home", "SQL Assistant", "Patient Reports", "Database Explorer"],
-        format_func=lambda x: f"🏠 {x}" if x == "Home" else f"🧠 {x}" if x == "SQL Assistant" else f"📄 {x}" if x == "Patient Reports" else f"📊 {x}"
+        format_func=lambda x: (
+            f"🏠 {x}" if x == "Home" 
+            else f"🧠 {x}" if x == "SQL Assistant"
+            else f"📄 {x}" if x == "Patient Reports"
+            else f"📊 {x}"
+        )
     )
-
 
 # ───────────────────────────────────────────────
 # PAGES
