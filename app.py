@@ -263,7 +263,7 @@ def render_auto_chart(df: pd.DataFrame):
 # ───────────────────────────────────────────────
 with st.sidebar:
     st.header("🗄 Database Connection")
-    db_name = st.text_input("SQLite filename", value="demo_healthcare.db", help="e.g. healthcare.db")
+    db_name = st.text_input("SQLite filename", value="healthcare.db", help="e.g. healthcare.db")
 
     if st.button("Connect to Database", type="primary"):
         try:
