@@ -1,3 +1,0 @@
-python3.11
-python3.11-dev
-python3.11-distutils
